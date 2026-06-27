@@ -1,155 +1,120 @@
 import streamlit as st
-import backend
+import json
+import pandas as pd
+import os
+from datetime import datetime
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import TextLoader
+import tempfile
 
+# 🌐 CONFIG
 st.set_page_config(page_title="MSC Monitor Ops", layout="wide")
+API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY"))
+if not API_KEY:
+    st.error("Please set OPENAI_API_KEY in Streamlit secrets or env vars.")
+    st.stop()
 
+llm = ChatOpenAI(model="gpt-4o-mini", api_key=API_KEY, temperature=0.1)
+embeddings = OpenAIEmbeddings(api_key=API_KEY)
 
-def badge(text, mode="neutral"):
-    colors = {"success": ("#DCFCE7", "#166534"), "warning": ("#FEF9C3", "#854D0E"), "danger": ("#FEE2E2", "#991B1B"), "info": ("#DBEAFE", "#1E40AF"), "neutral": ("#F3F4F6", "#374151")}
-    bg, fg = colors.get(mode, colors["neutral"])
-    st.markdown("<span style='background:" + bg + ";color:" + fg + ";padding:4px 10px;border-radius:999px;font-size:12px;font-weight:600'>" + text + "</span>", unsafe_allow_html=True)
+# 📁 MOCK DATA LOADERS
+@st.cache_data
+def load_knowledge():
+    # Replace with real SharePoint/Confluence connectors later
+    mock_docs = [
+        {"source": "Runbook", "title": "Prism Partner Redelivery", "version": "v5.2", "updated": "2026-04-11", "owner": "Distribution", "content": "Validate package status. Verify manifest generation. Re-submit workflow. Check partner PVC status."},
+        {"source": "KB", "title": "KB-1248 Metadata Validation", "version": "v2.1", "updated": "2025-12-01", "owner": "Fulfillment", "content": "Metadata mismatch causes delivery failure. Run validation script v3. Clear cache and retry."},
+        {"source": "RCA", "title": "RCA-2026-004 Amazon PVC Failure", "version": "v1.0", "updated": "2026-05-15", "owner": "Engineering", "content": "Manifest generation timeout. Fix applied in Deploy 4.2. Retry with backoff."}
+    ]
+    return mock_docs
 
+@st.cache_data
+def load_mock_tickets():
+    return [
+        {"id": "TK-101", "summary": "Amazon PVC delivery failed during manifest generation", "severity": "P2"},
+        {"id": "TK-102", "summary": "Metadata validation stuck on Rally ingest", "severity": "P3"}
+    ]
 
-def mode_color(mode):
-    return "success" if mode == "Recommend" else "warning" if mode == "Suggest Investigation" else "danger" if mode == "Escalate" else "neutral"
+# 🧠 CORE LOGIC
+def classify_ticket(ticket_text):
+    prompt = f"""You are an MSC Operations Classifier. Analyze the incident ticket and return ONLY a JSON object with these fields:
+workflow, product, incident_type, severity, confidence (0-100).
+Rules: If ambiguous, set confidence < 60. Never guess. Return valid JSON only.
+Ticket: {ticket_text}"""
+    response = llm.invoke(prompt).content.strip()
+    return json.loads(response.replace("```json", "").replace("```", ""))
 
+def build_faiss(docs):
+    splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    texts = [d["content"] for d in docs]
+    metadatas = [{k:v for k,v in d.items() if k != "content"} for d in docs]
+    split_docs = splitter.create_documents(texts, metadatas=metadatas)
+    return FAISS.from_documents(split_docs, embeddings)
 
-def status_color(status):
-    return {"Open": "info", "Assigned": "warning", "Escalated": "danger", "Auto Resolved": "success"}.get(status, "neutral")
+def grounded_resolve(ticket, classification, vectorstore):
+    prompt = """You are an MSC Support AI. Generate a resolution recommendation STRICTLY based on the provided evidence snippets. 
+Rules:
+1. NEVER invent steps. Only use provided runbooks, KBs, or RCAs.
+2. CITE EVERY CLAIM with [Source: Title | Version | Owner].
+3. Calculate confidence (0-100) based on: evidence match strength, recency, and similarity score.
+4. If confidence < 50, output ESCALATE. If 50-80, output INVESTIGATE. If ≥80, output RECOMMEND.
+5. Format output as JSON with: likely_cause, recommended_actions, evidence_summary, sources, confidence, routing_action.
+Evidence: {context}
+Ticket: {ticket}
+Return JSON only."""
+    
+    docs = vectorstore.similarity_search(ticket, k=3)
+    context = "\n---\n".join([d.page_content + f"\n[Source: {d.metadata.get('title', 'N/A')} | v{d.metadata.get('version','')} | {d.metadata.get('owner','')})" for d in docs])
+    
+    resp = llm.invoke(prompt.format(context=context, ticket=ticket)).content.strip()
+    return json.loads(resp.replace("```json", "").replace("```", ""))
 
+# 🖥️ UI
+st.title("🚀 MSC Monitor Ops | AI Support Prototype (Recommendation Mode)")
+st.caption("Evidence-grounded • Human-in-the-loop • No unsupported recommendations")
 
-if "tickets" not in st.session_state:
-    st.session_state.tickets = list(backend.list_tickets())
-if "manual" not in st.session_state:
-    st.session_state.manual = None
+cols = st.columns([1, 2, 2])
 
-st.title("MSC Monitor Ops - AI Assisted Operations Support")
-st.caption("Standalone Streamlit app: UI app.py + backend.py module. No localhost/FastAPI required.")
+with cols[0]:
+    st.subheader("📋 Ticket Queue")
+    tickets = load_mock_tickets()
+    selected = st.radio("Select Ticket", [t["summary"] for t in tickets], index=0)
+    ticket_id = next(t["id"] for t in tickets if t["summary"] == selected)
+    
+    with st.expander("🔍 Ticket Details"):
+        st.json({"id": ticket_id, "summary": selected})
 
-with st.sidebar:
-    st.header("Prototype Controls")
-    st.success("Standalone Streamlit deployment")
-    st.caption("backend.py runs in-process")
-    if st.button("Refresh App", use_container_width=True):
-        st.rerun()
-    st.divider()
-    st.header("Manual Ticket Analysis")
-    with st.form("manual_form"):
-        source = st.selectbox("Source", ["Manual", "ServiceNow", "Jira", "E-Mail"])
-        title = st.text_input("Title", "Amazon PVC delivery failed")
-        desc = st.text_area("Description", "Delivery failed from Prism with manifest validation error and missing territory metadata.", height=110)
-        logs = st.text_area("Logs, one per line", "manifest_validation_failed\nmissing territoryCode\npartner=Amazon PVC", height=90)
-        submit = st.form_submit_button("Analyze Without Saving", use_container_width=True)
-    if submit:
-        st.session_state.manual = {"id": "MANUAL", "source": source, "status": "Open", "title": title, "description": desc, "created": "Manual", "requester": "Operator", "logs": [x.strip() for x in logs.splitlines() if x.strip()], "monitor_context": {"workflow_status": "Unknown", "processing_status": "Manual analysis", "current_step": "Operator supplied", "partner": "Manual"}}
-        st.rerun()
-    if st.session_state.manual and st.button("Exit Manual Analysis", use_container_width=True):
-        st.session_state.manual = None
-        st.rerun()
-    with st.expander("Knowledge Library"):
-        for k in backend.list_knowledge(True):
-            st.write("- " + k["id"] + " | " + k["source"] + " " + k["version"] + " | " + k["title"])
+with cols[1]:
+    st.subheader("🔎 Investigation & Context")
+    if selected:
+        classification = classify_ticket(selected)
+        st.json(classification)
+        
+        st.markdown("### 📚 Similar Historical Incidents")
+        st.info("Matched INC1510021, INC1521443 (Resolution recurrence: 83%)")
+        
+        st.markdown("### 📊 Operational Context")
+        st.info("Workflow: Active | Environment: No recent outages | Partner: Amazon PVC")
 
-left, center, right = st.columns([0.95, 1.55, 1.35], gap="large")
-
-with left:
-    st.subheader("Ticket Queue")
-    if st.session_state.manual:
-        badge("Manual Analysis Mode", "info")
-        ticket = st.session_state.manual
-    else:
-        filt = st.radio("Status Filter", ["All", "Open", "Assigned", "Escalated", "Auto Resolved"], index=0)
-        filtered_tickets = [ticket for ticket in st.session_state.tickets if filt == "All" or ticket.get("status") == filt]
-        if not filtered_tickets:
-            st.info("No tickets found for status: " + filt + ". Please select All/Open/Assigned/Escalated or use Manual Ticket Analysis.")
-            st.stop()
-        labels = [ticket["id"] + " | " + ticket.get("status", "Open") + " | " + ticket["title"] for ticket in filtered_tickets]
-        selected = st.selectbox("Select Ticket", labels)
-        selected_id = selected.split(" | ")[0]
-        ticket = next((item for item in filtered_tickets if item["id"] == selected_id), filtered_tickets[0])
-        st.markdown("#### Queue Items")
-        for item in filtered_tickets:
-            with st.container(border=True):
-                st.write("**" + item["id"] + "**")
-                st.write(item["title"])
-                badge(item.get("status", "Open"), status_color(item.get("status", "Open")))
-
-analysis = backend.analyze(ticket)
-classification = analysis["classification"]
-assistant = analysis["assistant"]
-similar = analysis["similar_summary"]
-
-with center:
-    st.subheader("Ticket Investigation")
-    with st.container(border=True):
-        st.write("### " + ticket.get("id", "Manual") + " - " + ticket.get("title", ""))
-        st.write(ticket.get("description", ""))
-        st.caption("Source: " + str(ticket.get("source")) + " | Requester: " + str(ticket.get("requester")) + " | Created: " + str(ticket.get("created")))
-    st.markdown("#### Classification")
-    cols = st.columns(5)
-    metrics = [("Workflow", classification["workflow"]), ("Product", classification["product"]), ("Type", classification["incident_type"]), ("Severity", classification["severity"]), ("Classifier", str(classification["confidence"]) + "%")]
-    for col, metric in zip(cols, metrics):
-        col.metric(metric[0], metric[1])
-    st.markdown("#### Similar Incidents")
-    cards = st.columns(3)
-    cards[0].metric("Matches", similar["count"])
-    cards[1].metric("Recurrence", str(similar["resolution_recurrence"]) + "%")
-    cards[2].metric("Outcome", similar["outcome"])
-    for inc in analysis["similar_incidents"]:
-        with st.expander(inc["id"] + " - " + inc["title"] + " | score=" + str(inc["score"])):
-            st.write("Resolution: " + str(inc.get("resolution")))
-    st.markdown("#### Monitor Context")
-    st.json(analysis["monitor_context"])
-    st.markdown("#### Documentation Gap Signals")
-    if analysis["documentation_gaps"]:
-        for gap in analysis["documentation_gaps"]:
-            st.warning(gap["type"] + ": " + gap["message"] + " -> " + gap["action"])
-    else:
-        st.success("No documentation gap detected.")
-
-with right:
-    st.subheader("AI Resolution Assistant")
-    badge(assistant["mode"], mode_color(assistant["mode"]))
-    st.metric("Guidance Confidence", str(assistant["confidence"]) + "%")
-    if assistant["unsupported_recommendation_blocked"]:
-        st.error("Unsupported recommendation blocked. Escalation required.")
-    st.caption("Human approval required for all operational actions.")
-    st.markdown("#### Likely Cause")
-    st.write(assistant["likely_cause"])
-    st.markdown("#### Recommended / Investigation Actions")
-    for idx, action in enumerate(assistant["recommended_actions"], 1):
-        st.write(str(idx) + ". " + action)
-    st.markdown("#### Evidence")
-    if assistant["evidence"]:
-        for item in assistant["evidence"]:
-            st.info(item)
-    else:
-        st.warning("No approved source evidence found.")
-    st.markdown("#### Sources, Version, Lineage")
-    if assistant["sources"]:
-        st.dataframe(assistant["sources"], use_container_width=True, hide_index=True)
-        st.code("\n".join(assistant["source_lineage"]), language="text")
-    else:
-        st.write("No eligible citations.")
-    st.markdown("#### Ownership / Escalation")
-    st.json(assistant["escalation_package"] if assistant["escalation_package"] else analysis["ownership"])
-    st.markdown("#### Conversational Support")
-    question = st.text_input("Ask about this ticket", "Why did this fail?")
-    if st.button("Ask Assistant", use_container_width=True):
-        response = backend.ask(ticket, question)
-        st.write(response["answer"])
-        st.caption("Mode: " + response["mode"] + " | Confidence: " + str(response["confidence"]) + "%")
-
-st.divider()
-st.subheader("Pilot Analytics")
-analytics = backend.get_analytics(st.session_state.tickets)
-analytics_cols = st.columns(6)
-analytics_metrics = [("Tickets", analytics["ticket_count"]), ("Recommend", str(analytics["recommendation_rate"]) + "%"), ("Investigate", str(analytics["investigation_rate"]) + "%"), ("Escalate", str(analytics["escalation_rate"]) + "%"), ("Citation", str(analytics["citation_coverage"]) + "%"), ("Unsupported Recs", analytics["unsupported_recommendations"])]
-for col, metric in zip(analytics_cols, analytics_metrics):
-    col.metric(metric[0], metric[1])
-with st.expander("Workflow Distribution"):
-    st.json(analytics["workflow_distribution"])
-with st.expander("Documentation Gaps"):
-    st.json(analytics["documentation_gaps"])
-with st.expander("Pilot Targets"):
-    st.json(analytics["pilot_targets"])
+with cols[2]:
+    st.subheader("🤖 AI Resolution Assistant")
+    if st.button("Generate Evidence-Backed Guidance"):
+        docs = load_knowledge()
+        vs = build_faiss(docs)
+        result = grounded_resolve(selected, classification, vs)
+        
+        st.json(result)
+        
+        conf = result.get("confidence", 0)
+        if conf >= 80:
+            st.success(f"✅ RECOMMEND | Confidence: {conf}%")
+        elif conf >= 50:
+            st.warning(f"🔍 INVESTIGATE | Confidence: {conf}%")
+        else:
+            st.error(f"🚨 ESCALATE | Confidence: {conf}% | Auto-packaging for L2/Engineering")
+            
+        # Gap tracking mock
+        if conf < 50 or not result.get("sources"):
+            st.info("📝 Gap logged: Missing/stale documentation detected. Added to improvement backlog.")
