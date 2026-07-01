@@ -1,5 +1,5 @@
 """
-VideoForge Studio V3.1
+VideoForge Studio V3.1 (patched)
 Professional Video Optimization Platform
 Streamlit single-file app
 """
@@ -387,11 +387,14 @@ li[aria-selected="true"] {
     color: #ffffff !important;
 }
 
+/* Expanders — overflow left as visible (not hidden) so nested content
+   such as wide tables/code blocks can never get clipped by the rounded
+   corners; the rounding still looks clean because header/body already
+   have matching radii from Streamlit's own markup. */
 [data-testid="stExpander"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
     border-radius: 16px !important;
-    overflow: hidden;
 }
 
 [data-testid="stExpander"] summary {
@@ -1003,7 +1006,16 @@ def encode_video(
     src_meta: Dict[str, Any],
     sid: str,
     cb=None,
+    trim_seconds: Optional[float] = None,
 ) -> Tuple[Optional[Path], Path, Dict[str, Any]]:
+    """
+    Standard single-pass CRF encode.
+
+    trim_seconds: if set, output is capped to this many seconds (used by the
+    CRF Sweep tab so users can preview settings on a short clip instead of
+    paying full encode cost per CRF step). Progress percentage is computed
+    against the trimmed duration, not the full source duration, when set.
+    """
     log = LOG_DIR / f"{sid}.log"
     info = ffinfo()
 
@@ -1045,9 +1057,17 @@ def encode_video(
     elif vf:
         cmd += ["-vf", vf]
 
-    cmd += args + [str(out)]
+    cmd += args
 
-    duration = max(src_meta.get("duration", 0.001), 0.001)
+    if trim_seconds and trim_seconds > 0:
+        cmd += ["-t", str(trim_seconds)]
+
+    cmd += [str(out)]
+
+    full_duration = max(src_meta.get("duration", 0.001), 0.001)
+    duration = min(trim_seconds, full_duration) if trim_seconds else full_duration
+    duration = max(duration, 0.001)
+
     rc, lines = _run_encode_pass(cmd, duration, log, cb, phase=(0.0, 1.0), label="Encoding")
 
     if cb:
@@ -1188,7 +1208,20 @@ def encode_two_pass(
 # Quality metrics
 # ============================================================
 
-def quality_metrics(ref: Path, dist: Path, sid: str, quick: bool = True) -> Dict[str, Any]:
+def quality_metrics(
+    ref: Path,
+    dist: Path,
+    sid: str,
+    quick: bool = True,
+    limit_sec: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    quick=True caps analysis to a sample window (60s by default) for speed.
+    limit_sec, if given, overrides that window length explicitly — e.g. the
+    CRF Sweep tab wires its "sample duration" selector into this so the
+    quality-metric window actually matches what the user picked, and
+    limit_sec=None with quick=False analyzes the full clip.
+    """
     res: Dict[str, Any] = {}
     info = ffinfo()
 
@@ -1202,7 +1235,15 @@ def quality_metrics(ref: Path, dist: Path, sid: str, quick: bool = True) -> Dict
     if not w or not h:
         return res
 
-    limit = ["-t", "60"] if quick else []
+    eff_limit: Optional[float]
+    if limit_sec is not None:
+        eff_limit = limit_sec
+    elif quick:
+        eff_limit = 60.0
+    else:
+        eff_limit = None
+
+    limit = ["-t", str(eff_limit)] if eff_limit else []
 
     graph = (
         f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[refp][refs];"
@@ -1453,6 +1494,13 @@ def toast(msg: str, icon: str = "✅"):
 
 
 def player(path: Path, poster: Optional[Path], mime: str):
+    """
+    Universal inline player. IMPORTANT: the <video> element must contain a
+    proper <source> tag — if it doesn't, browsers fall back to rendering the
+    element's raw text content, which here would be a multi-megabyte base64
+    string dumped visibly into the page (this was the cause of the reported
+    "overlap"/broken layout — not a CSS issue).
+    """
     if not path or not path.exists():
         return
 
@@ -1473,7 +1521,8 @@ def player(path: Path, poster: Optional[Path], mime: str):
         f"""
         <div style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
             <video controls preload='metadata' style='width:100%;max-height:520px;background:#000;border-radius:10px' {pa}>
-                data:{mime};base64,{vb64}
+                <source src='data:{mime};base64,{vb64}' type='{mime}'>
+                Your browser does not support inline video playback.
             </video>
         </div>
         """,
@@ -1672,6 +1721,9 @@ with tab_work:
 
             with tc4:
                 preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2)
+
+            if codec == "AV1":
+                st.caption("ℹ️ AV1 two-pass uses a fixed internal speed setting (cpu-used=6) — the Preset selector above is ignored for AV1.")
 
             crf = None
 
@@ -2195,7 +2247,13 @@ with tab_sweep:
         sw_end = sw4.number_input("CRF end", int(sw_start) + 1, 51, 38, key="sweep_end_v3")
         sw_step = st.slider("Step", 1, 10, 4, key="sweep_step_v3")
 
-        sweep_sample = st.selectbox("Sweep sample duration", ["30", "60", "120", "Full"], index=1)
+        sweep_sample = st.selectbox(
+            "Sweep sample duration",
+            ["30", "60", "120", "Full"],
+            index=1,
+            help="Each CRF step encodes only this many seconds of the source (from the start), and quality metrics are computed over the same window — keeps sweeps fast on long clips. Choose Full to encode and measure the entire source.",
+        )
+        trim_val: Optional[float] = None if sweep_sample == "Full" else float(sweep_sample)
 
         st.info(
             "Sweep uses the existing encoder path. For very long files, use 30s or 60s sampling to avoid heavy cloud workloads."
@@ -2241,10 +2299,15 @@ with tab_sweep:
                             min(0.99, (i + p) / len(crfs)),
                             text=f"CRF {cval} · {t}",
                         ),
+                        trim_seconds=trim_val,
                     )
 
                     if out_p:
-                        qm = quality_metrics(src, out_p, sid, quick=True)
+                        qm = quality_metrics(
+                            src, out_p, sid,
+                            quick=(trim_val is not None),
+                            limit_sec=trim_val,
+                        )
                         dm = media(out_p)
 
                         rows.append({
