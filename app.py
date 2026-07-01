@@ -79,10 +79,16 @@ st.markdown(
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 
 <style>
+/* ---- base reset & containment ---- */
 html, body, [data-testid="stAppViewContainer"], .stApp {
     font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
     background: linear-gradient(180deg, #f7faff 0%, #eef4fb 100%) !important;
     color: #0f172a !important;
+    overflow-x: hidden !important;
+}
+
+* {
+    box-sizing: border-box !important;
 }
 
 [data-testid="stHeader"] {
@@ -95,26 +101,27 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
 }
 
 .block-container {
-    padding-top: 1.4rem;
-    padding-bottom: 3rem;
-    max-width: 1440px;
+    padding-top: 1.4rem !important;
+    padding-bottom: 3rem !important;
+    padding-left: 1.5rem !important;
+    padding-right: 1.5rem !important;
+    max-width: 100% !important;
 }
 
-* {
-    font-family: 'Inter', -apple-system, sans-serif !important;
-}
-
+/* ---- headings ---- */
 h1, h2, h3, h4 {
     letter-spacing: -0.02em;
     color: #0f172a;
     font-weight: 800;
 }
 
+/* ---- hide Streamlit cruft ---- */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {
     visibility: hidden !important;
     height: 0 !important;
 }
 
+/* ---- hero ---- */
 .hero {
     background: linear-gradient(135deg, #ffffff 0%, #f0f6ff 100%);
     border: 1px solid #dbeafe;
@@ -122,14 +129,13 @@ h1, h2, h3, h4 {
     padding: 26px 30px;
     box-shadow: 0 12px 36px rgba(59,130,246,.10);
     margin-bottom: 22px;
+    overflow: hidden;
 }
-
 .hero h1 {
     font-size: 2.2rem;
     margin: 0;
     font-weight: 900;
 }
-
 .hero p {
     color: #475569;
     margin: 8px 0 0;
@@ -137,6 +143,7 @@ h1, h2, h3, h4 {
     line-height: 1.55;
 }
 
+/* ---- badges ---- */
 .badge {
     display: inline-flex;
     align-items: center;
@@ -150,6 +157,7 @@ h1, h2, h3, h4 {
     font-size: .8rem;
 }
 
+/* ---- section titles ---- */
 .section-title {
     font-size: .72rem;
     letter-spacing: .22em;
@@ -159,14 +167,15 @@ h1, h2, h3, h4 {
     margin: 28px 0 16px;
 }
 
+/* ---- metric cards ---- */
 .metric-card {
     background: #fff;
     border: 1px solid #e5edf5;
     border-radius: 16px;
     padding: 16px;
     box-shadow: 0 4px 14px rgba(15,23,42,.04);
+    overflow: hidden;
 }
-
 .metric-label {
     font-size: .72rem;
     text-transform: uppercase;
@@ -174,20 +183,19 @@ h1, h2, h3, h4 {
     color: #64748b;
     font-weight: 700;
 }
-
 .metric-value {
     font-size: 1.5rem;
     font-weight: 800;
     color: #0f172a;
     margin-top: 4px;
 }
-
 .metric-sub {
     font-size: .8rem;
     color: #64748b;
     margin-top: 2px;
 }
 
+/* ---- info strips ---- */
 .info-strip {
     background: #dbeafe;
     color: #1e3a8a;
@@ -198,7 +206,6 @@ h1, h2, h3, h4 {
     margin: 10px 0;
     font-size: .9rem;
 }
-
 .warn-strip {
     background: #fef3c7;
     color: #92400e;
@@ -209,7 +216,6 @@ h1, h2, h3, h4 {
     margin: 10px 0;
     font-size: .9rem;
 }
-
 .ok-strip {
     background: #d1fae5;
     color: #065f46;
@@ -221,18 +227,21 @@ h1, h2, h3, h4 {
     font-size: .9rem;
 }
 
+/* ---- comparison panels ---- */
+.compare-input,
+.compare-output {
+    border-radius: 16px;
+    padding: 18px;
+    overflow: hidden;
+    width: 100%;
+}
 .compare-input {
     background: linear-gradient(135deg,#f1f5f9,#e2e8f0);
     border: 1px solid #cbd5e1;
-    border-radius: 16px;
-    padding: 18px;
 }
-
 .compare-output {
     background: linear-gradient(135deg,#dbeafe,#bfdbfe);
     border: 1px solid #93c5fd;
-    border-radius: 16px;
-    padding: 18px;
 }
 
 .compare-row {
@@ -242,21 +251,19 @@ h1, h2, h3, h4 {
     border-bottom: 1px solid rgba(0,0,0,.06);
     font-size: .9rem;
 }
-
 .compare-row:last-child {
     border-bottom: 0;
 }
-
 .compare-label {
     color: #64748b;
     font-weight: 600;
 }
-
 .compare-val {
     color: #0f172a;
     font-weight: 700;
 }
 
+/* ---- savings card ---- */
 .savings-card {
     background: linear-gradient(135deg, #059669, #10b981);
     color: white;
@@ -264,14 +271,13 @@ h1, h2, h3, h4 {
     padding: 20px;
     text-align: center;
     box-shadow: 0 10px 26px rgba(5,150,105,.25);
+    overflow: hidden;
 }
-
 .savings-value {
     font-size: 2.4rem;
     font-weight: 900;
     line-height: 1;
 }
-
 .savings-label {
     font-size: .8rem;
     opacity: .9;
@@ -280,6 +286,7 @@ h1, h2, h3, h4 {
     margin-top: 6px;
 }
 
+/* ---- buttons ---- */
 .stButton>button {
     border-radius: 12px !important;
     border: 0 !important;
@@ -289,29 +296,30 @@ h1, h2, h3, h4 {
     box-shadow: 0 8px 18px rgba(37,99,235,.22);
     padding: 10px 18px !important;
 }
-
 .stDownloadButton>button {
     border-radius: 12px !important;
     font-weight: 700 !important;
 }
 
+/* ---- metrics (Streamlit’s own) ---- */
 [data-testid="stMetric"] {
     background: #fff;
     border: 1px solid #e5edf5;
     border-radius: 14px;
     padding: 14px;
+    overflow: hidden;
 }
-
 [data-testid="stMetricValue"],
 [data-testid="stMetricLabel"],
 [data-testid="stMetricDelta"] {
     color: #0f172a !important;
 }
 
+/* ---- tabs ---- */
 .stTabs [data-baseweb="tab-list"] {
     gap: 8px;
+    flex-wrap: wrap;
 }
-
 .stTabs [data-baseweb="tab"] {
     background: #fff;
     border: 1px solid #e5edf5;
@@ -320,29 +328,29 @@ h1, h2, h3, h4 {
     font-weight: 600;
     color: #0f172a;
 }
-
 .stTabs [aria-selected="true"] {
     background: #eff6ff !important;
     color: #1d4ed8 !important;
     border-color: #93c5fd !important;
 }
 
+/* ---- video ---- */
 video {
     border-radius: 14px;
     background: #000;
+    max-width: 100%;
 }
 
-hr {
-    border-color: #e5edf5;
-}
-
+/* ---- containers with border ---- */
 [data-testid="stVerticalBlockBorderWrapper"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
     border-radius: 18px !important;
     box-shadow: 0 8px 22px rgba(15,23,42,.04);
+    overflow: hidden !important;   /* keep children inside */
 }
 
+/* ---- labels ---- */
 label,
 [data-testid="stWidgetLabel"] p,
 .stCheckbox p,
@@ -351,10 +359,7 @@ label,
     font-weight: 600 !important;
 }
 
-[data-testid="stMarkdownContainer"] p {
-    color: inherit;
-}
-
+/* ---- inputs ---- */
 .stTextInput input,
 .stNumberInput input,
 .stTextArea textarea {
@@ -363,64 +368,86 @@ label,
     border: 1px solid #cbd5e1 !important;
     border-radius: 10px !important;
 }
-
 .stSelectbox div[data-baseweb="select"] > div {
     background: #ffffff !important;
     color: #0f172a !important;
     border-radius: 10px !important;
 }
-
 div[data-baseweb="popover"] div[data-baseweb="menu"],
 ul[role="listbox"],
 li[role="option"] {
     background: #ffffff !important;
     color: #0f172a !important;
 }
-
 li[role="option"]:hover,
 li[aria-selected="true"] {
     background: #eff6ff !important;
 }
 
+/* ---- tooltips ---- */
 [data-baseweb="tooltip"] {
     background: #0f172a !important;
     color: #ffffff !important;
 }
 
-/* Expanders – overflow hidden to prevent content spilling
-   into adjacent sections; rounded corners remain clean.
-   Fixes the reported UI overlap issue. */
+/* ---- EXPANDERS – the real fix ---- */
 [data-testid="stExpander"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
     border-radius: 16px !important;
-    overflow: hidden !important;
+    overflow: hidden !important;   /* keep everything clipped */
+    margin-bottom: 12px !important;
 }
-
 [data-testid="stExpander"] summary {
     color: #0f172a !important;
     font-weight: 700 !important;
 }
+[data-testid="stExpander"] > div:last-child {
+    padding: 0 16px 16px 16px !important;  /* inner padding */
+    overflow: visible !important;           /* allow inner content to flow, but parent still clips */
+}
+/* Without this, the inner container might still overflow; we ensure it’s contained */
+[data-testid="stExpander"] .stMarkdown {
+    max-width: 100% !important;
+}
 
+/* ---- file uploader ---- */
 [data-testid="stFileUploaderDropzone"] {
     background: #f8fafc !important;
     border: 1.5px dashed #cbd5e1 !important;
     border-radius: 14px !important;
 }
-
 [data-testid="stFileUploaderDropzone"] * {
     color: #475569 !important;
 }
 
+/* ---- dataframes ---- */
 [data-testid="stDataFrame"],
 [data-testid="stTable"] {
     background: #ffffff !important;
     border-radius: 12px;
-    overflow: hidden;
+    overflow: auto;
 }
 
+/* ---- alerts ---- */
 [data-testid="stAlert"] {
     border-radius: 12px !important;
+}
+
+/* ---- custom player container (components.html) ---- */
+.video-player-container {
+    max-width: 100%;
+    overflow: hidden;
+}
+.video-player-container video {
+    max-width: 100%;
+    height: auto;
+    max-height: 520px;
+}
+
+/* ---- slider label keep on one line ---- */
+[data-testid="stSlider"] label p {
+    white-space: nowrap !important;
 }
 </style>
 """,
@@ -1521,14 +1548,14 @@ def player(path: Path, poster: Optional[Path], mime: str):
 
     components.html(
         f"""
-        <div style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
+        <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
             <video controls preload='metadata' style='width:100%;max-height:520px;background:#000;border-radius:10px' {pa}>
                 <source src='data:{mime};base64,{vb64}' type='{mime}'>
                 Your browser does not support inline video playback.
             </video>
         </div>
         """,
-        height=560,
+        height=None,   # let the browser size it automatically
     )
 
 
