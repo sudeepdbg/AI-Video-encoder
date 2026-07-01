@@ -156,7 +156,7 @@ h1, h2, h3, h4 {
     text-transform: uppercase;
     color: #64748b;
     font-weight: 800;
-    margin: 24px 0 12px;
+    margin: 28px 0 16px;
 }
 
 .metric-card {
@@ -387,14 +387,14 @@ li[aria-selected="true"] {
     color: #ffffff !important;
 }
 
-/* Expanders — overflow left as visible (not hidden) so nested content
-   such as wide tables/code blocks can never get clipped by the rounded
-   corners; the rounding still looks clean because header/body already
-   have matching radii from Streamlit's own markup. */
+/* Expanders – overflow hidden to prevent content spilling
+   into adjacent sections; rounded corners remain clean.
+   Fixes the reported UI overlap issue. */
 [data-testid="stExpander"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
     border-radius: 16px !important;
+    overflow: hidden !important;
 }
 
 [data-testid="stExpander"] summary {
@@ -1661,6 +1661,8 @@ with tab_work:
                 unsafe_allow_html=True,
             )
 
+    st.markdown("<br>", unsafe_allow_html=True)   # vertical spacing
+
     st.markdown("<div class='section-title'>Step 2 · Optimization Goal</div>", unsafe_allow_html=True)
 
     with st.container(border=True):
@@ -1770,6 +1772,8 @@ with tab_work:
 
             target_mb, target_audio_kbps = None, None
 
+    st.markdown("<br>", unsafe_allow_html=True)
+
     st.markdown("<div class='section-title'>Step 3 · Enhancements</div>", unsafe_allow_html=True)
 
     with st.container(border=True):
@@ -1850,6 +1854,8 @@ with tab_work:
                 f"Active: {', '.join(risky)}."
             )
 
+    st.markdown("<br>", unsafe_allow_html=True)
+
     st.markdown("<div class='section-title'>Step 4 · Preview Impact</div>", unsafe_allow_html=True)
 
     if src_meta:
@@ -1890,6 +1896,8 @@ with tab_work:
                     render_metric("Est. Encode Time", f"{m // 60}m {m % 60}s")
     else:
         st.info("Upload a source video to see estimates.")
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     st.markdown("<div class='section-title'>Step 5 · Encode</div>", unsafe_allow_html=True)
 
@@ -2010,6 +2018,9 @@ with tab_work:
                         out_path.name,
                         md.get("mime", "application/octet-stream"),
                     )
+
+    # final spacing after encode button
+    st.markdown("<br>", unsafe_allow_html=True)
 
 
 # ============================================================
