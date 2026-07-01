@@ -1,7 +1,7 @@
 """
 VideoForge Studio V3.1 (patched)
 Professional Video Optimization Platform
-Streamlit single-file app
+
 """
 
 import os
@@ -1416,8 +1416,10 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
                 f.write("\n$ " + " ".join(map(str, cmd)) + "\n" + (p.stdout or ""))
 
             if p.returncode == 0 and (od / name).exists():
+                # Corrected BANDWIDTH: total bitrate = video + audio + small overhead
+                total_br_bps = int((br_k + 96) * 1000 * 1.1)   # audio 96k + 10% overhead
                 lines += [
-                    f"#EXT-X-STREAM-INF:BANDWIDTH={br_k * 1000},RESOLUTION={w}x{h}",
+                    f"#EXT-X-STREAM-INF:BANDWIDTH={total_br_bps},RESOLUTION={w}x{h}",
                     name,
                 ]
             else:
