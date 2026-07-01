@@ -1078,7 +1078,8 @@ def encode_two_pass(
 
     duration = src_meta.get("duration", 0)
 
-    if duration <= 0log, {"error": "Could not determine source duration. Target-size mode needs known duration."}
+    if duration <= 0:
+        return None, log, {"error": "Could not determine source duration. Target-size mode needs known duration."}
 
     codec = opts.get("codec", "AVC (H.264)")
     preset = opts.get("preset", "medium")
