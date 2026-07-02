@@ -347,7 +347,9 @@ video {
     border: 1px solid #e5edf5 !important;
     border-radius: 18px !important;
     box-shadow: 0 8px 22px rgba(15,23,42,.04);
-    overflow: hidden !important;   /* keep children inside */
+    /* overflow:hidden was clipping select dropdowns / dataframes / wide
+       code blocks rendered inside containers. Corners stay rounded via
+       border-radius; content is no longer cut off. */
 }
 
 /* ---- labels ---- */
@@ -390,25 +392,36 @@ li[aria-selected="true"] {
     color: #ffffff !important;
 }
 
-/* ---- EXPANDERS – the real fix ---- */
+/* ---- EXPANDERS ----
+   NOTE: overflow:hidden on the expander shell used to clip select dropdowns,
+   dataframes, and st.code blocks living inside an expander (anything that
+   needs to render wider/taller than the collapsed shell got cut off — this
+   was the real source of the recurring "DOM overlap" reports). Rounded
+   corners are achieved with border-radius alone; overflow no longer needs
+   to be hidden for that. */
 [data-testid="stExpander"] {
     background: #ffffff !important;
     border: 1px solid #e5edf5 !important;
     border-radius: 16px !important;
-    overflow: hidden !important;   /* keep everything clipped */
     margin-bottom: 12px !important;
 }
 [data-testid="stExpander"] summary {
     color: #0f172a !important;
     font-weight: 700 !important;
+    border-radius: 16px !important;
 }
 [data-testid="stExpander"] > div:last-child {
     padding: 0 16px 16px 16px !important;  /* inner padding */
-    overflow: visible !important;           /* allow inner content to flow, but parent still clips */
 }
-/* Without this, the inner container might still overflow; we ensure it’s contained */
 [data-testid="stExpander"] .stMarkdown {
     max-width: 100% !important;
+}
+
+/* ---- popovers / select menus must always render above everything,
+   including inside containers/expanders that establish their own
+   stacking context ---- */
+div[data-baseweb="popover"] {
+    z-index: 999999 !important;
 }
 
 /* ---- file uploader ---- */
@@ -786,15 +799,39 @@ def build_filter_chain(opts: Dict[str, Any], src_meta: Dict[str, Any]) -> str:
 # Codec args
 # ============================================================
 
+def _gop_size(src_meta: Dict[str, Any]) -> int:
+    """
+    ~2s closed GOP aligned to source fps. A fixed, moderate GOP (rather than
+    each encoder's own default, which can be 250 frames / ~10s at 25fps)
+    keeps files seekable, keeps HLS/ABR segment boundaries clean, and caps
+    how much damage a single bad scene-cut decision can do to a segment —
+    the same reasoning content-adaptive encoders (Netflix per-title, the
+    Visionular Aurora line) apply before any bitrate optimization happens.
+    """
+    fps = src_meta.get("fps", 0) or 30
+    return max(24, int(round(fps * 2)))
+
+
 def codec_args(
     codec: str,
     crf: int,
     preset: str,
     profile: Dict[str, Any],
     src_meta: Dict[str, Any],
+    content_tune: str = "Auto",
+    maxrate_kbps: Optional[int] = None,
 ) -> Tuple[List[str], str, str, str, str]:
+    """
+    content_tune: "Auto" (default psy/AQ tuning), "Film / live-action",
+    "Animation", "Screen / UGC-graphics", or "Grain-heavy". Mirrors the
+    scene-based tuning presets that dedicated CAE encoders (Aurora4/5/1)
+    expose, approximated here with the equivalent open x264/x265/SVT-AV1
+    flags — psy-rd and AQ mode change how bits get allocated within a
+    frame, not just how many bits are used.
+    """
     width = src_meta.get("width", 1280)
     mbr_key = "mbr_1080p" if width >= 1500 else "mbr_720p"
+    gop = _gop_size(src_meta)
 
     if codec == "AVC (H.264)":
         enc = "libx264" if has_encoder("libx264") else "h264"
@@ -807,6 +844,24 @@ def codec_args(
             "-b:a", profile["audio_aac"],
             "-movflags", "+faststart",
         ]
+
+        if enc == "libx264":
+            args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "40"]
+
+            x264_params = ["aq-mode=3", "aq-strength=0.9"]
+            if content_tune == "Animation":
+                args += ["-tune", "animation"]
+            elif content_tune == "Screen / UGC-graphics":
+                x264_params += ["psy-rd=0.4,0.0"]
+            elif content_tune == "Grain-heavy":
+                args += ["-tune", "grain"]
+            else:
+                x264_params += ["psy-rd=1.0,0.15"]
+            args += ["-x264-params", ":".join(x264_params)]
+
+            if maxrate_kbps:
+                args += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
+
         return args, ".mp4", "video/mp4", enc, ""
 
     if codec == "HEVC (H.265)":
@@ -821,18 +876,36 @@ def codec_args(
             "-movflags", "+faststart",
         ]
         if enc == "libx265":
-            args += ["-tag:v", "hvc1", "-x265-params", "log-level=error:repeat-headers=1"]
+            x265_params = [
+                "log-level=error",
+                "repeat-headers=1",
+                f"keyint={gop}",
+                f"min-keyint={gop}",
+                "aq-mode=3",
+                "aq-strength=0.9",
+            ]
+            if content_tune == "Grain-heavy":
+                x265_params.append("rd=4")
+            if maxrate_kbps:
+                x265_params += [f"vbv-maxrate={maxrate_kbps}", f"vbv-bufsize={maxrate_kbps * 2}"]
+            args += ["-tag:v", "hvc1", "-x265-params", ":".join(x265_params)]
         return args, ".mp4", "video/mp4", enc, ""
 
     av1_cfg = profile["av1"]
     mbr = av1_cfg.get(mbr_key, 0)
 
     if has_encoder("libsvtav1"):
+        svt_params = [f"tune={0 if content_tune == 'Grain-heavy' else 1}"]
+        if content_tune == "Grain-heavy":
+            svt_params.append("film-grain=8")
+
         args = [
             "-c:v", "libsvtav1",
             "-crf", str(crf),
             "-preset", str(av1_cfg["preset"]),
+            "-g", str(gop),
             "-pix_fmt", "yuv420p",
+            "-svtav1-params", ":".join(svt_params),
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
         ]
@@ -849,6 +922,7 @@ def codec_args(
             "-b:v", "0",
             "-cpu-used", "6",
             "-row-mt", "1",
+            "-g", str(gop),
             "-pix_fmt", "yuv420p",
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
@@ -862,6 +936,7 @@ def codec_args(
         "medium" if preset not in ["veryfast", "fast", "medium", "slow"] else preset,
         fallback_profile,
         src_meta,
+        content_tune,
     )
     return args, ext, mime, actual, "AV1 encoder unavailable. Fell back to H.264."
 
@@ -930,8 +1005,16 @@ def bitrate_from_target_size(
     duration_sec: float,
     target_mb: float,
     audio_kbps: int = 128,
-    overhead_pct: float = 2.0,
+    overhead_pct: float = 6.0,
 ) -> int:
+    """
+    overhead_pct default raised from 2% to 6%: two-pass x264/x265 typically
+    lands within ~1-3% of the requested video bitrate, but container
+    muxing (moov atom, index) plus that per-pass variance can still push a
+    "just barely under the cap" encode over a hard limit (e.g. Discord's
+    25MB, an email attachment cap). A larger built-in margin trades a
+    little headroom for actually honoring "guaranteed target size".
+    """
     if duration_sec <= 0 or target_mb <= 0:
         return 0
 
@@ -1054,7 +1137,14 @@ def encode_video(
     crf = int(opts["crf"])
     preset = str(opts["preset"])
 
-    args, ext, mime, actual_encoder, warning = codec_args(codec, crf, preset, profile, src_meta)
+    maxrate_kbps = None
+    if opts.get("cap_peak_bitrate"):
+        est = estimate_output(src_meta, codec, crf, opts)
+        maxrate_kbps = max(300, int(est["est_bitrate_kbps"] * 2.2))
+
+    args, ext, mime, actual_encoder, warning = codec_args(
+        codec, crf, preset, profile, src_meta, opts.get("content_tune", "Auto"), maxrate_kbps
+    )
 
     codec_label = actual_encoder.replace("lib", "").replace("-", "")
     out = OUT_DIR / f"{clean(src.name)}_{codec_label}_crf{crf}_{sid[:8]}{ext}"
@@ -1133,7 +1223,8 @@ def encode_two_pass(
     target_mb = float(opts.get("target_mb", 25))
     audio_kbps = int(opts.get("audio_kbps", 128))
 
-    v_kbps = bitrate_from_target_size(duration, target_mb, audio_kbps)
+    safety_margin_pct = float(opts.get("safety_margin_pct", 6.0))
+    v_kbps = bitrate_from_target_size(duration, target_mb, audio_kbps, safety_margin_pct)
 
     if v_kbps <= 0:
         return None, log, {
@@ -1359,6 +1450,153 @@ def analyze_complexity(src: Path, duration: float, sid: str) -> float:
     avg_diff = sum(vals) / len(vals)
 
     return round(max(0.0, min(1.0, avg_diff / 20.0)), 3)
+
+
+def find_crf_for_target_vmaf(
+    src: Path,
+    width: int,
+    height: int,
+    target_vmaf: float,
+    sample_sec: float,
+    sample_start: float,
+    codec: str = "AVC (H.264)",
+    preset: str = "veryfast",
+    crf_lo: int = 18,
+    crf_hi: int = 40,
+    max_probes: int = 4,
+) -> Dict[str, Any]:
+    """
+    Measured, VMAF-targeted rate point for one resolution rung — the open-source
+    approximation of what Netflix per-title encoding and content-adaptive
+    encoders (Visionular's Aurora line) do: probe a handful of encode points
+    on a short sample, measure actual perceptual quality, and binary-search
+    to the CRF that lands closest to a target VMAF, instead of assuming a
+    fixed CRF/bitrate works equally well for every title. Only a short
+    sample window is encoded per probe to keep this fast enough to run
+    inline in a Streamlit session.
+    """
+    info = ffinfo()
+    lo, hi = crf_lo, crf_hi
+    best: Optional[Dict[str, Any]] = None
+
+    sm = {"width": width, "height": height, "fps": 30, "duration": sample_sec}
+
+    for _ in range(max_probes):
+        crf = (lo + hi) // 2
+        sid = uuid.uuid4().hex
+        log = LOG_DIR / f"{sid}.log"
+
+        vf = f"scale={width}:{height}:flags=lanczos"
+        enc = "libx264" if (codec != "HEVC (H.265)" or not has_encoder("libx265")) else "libx265"
+        cmd = [
+            info["ffmpeg"], "-hide_banner", "-y",
+            "-ss", str(round(sample_start, 2)),
+            "-i", str(src),
+            "-t", str(sample_sec),
+            "-vf", vf,
+            "-c:v", enc, "-preset", preset, "-crf", str(crf),
+            "-pix_fmt", "yuv420p", "-an",
+        ]
+        probe_out = LOG_DIR / f"{sid}_probe.mp4"
+        cmd.append(str(probe_out))
+
+        run_ffmpeg(cmd, log, 300)
+
+        if not probe_out.exists():
+            break
+
+        qm = quality_metrics(src, probe_out, sid, quick=True, limit_sec=sample_sec)
+        vmaf = qm.get("VMAF", qm.get("VMAF_proxy"))
+
+        try:
+            probe_out.unlink()
+        except Exception:
+            pass
+
+        if vmaf is None:
+            break
+
+        cand = {"crf": crf, "vmaf": vmaf, "size_bytes": 0}
+        if best is None or abs(vmaf - target_vmaf) < abs(best["vmaf"] - target_vmaf):
+            best = cand
+
+        if vmaf > target_vmaf:
+            lo = crf + 1   # too good / too big -> raise CRF (smaller, lower quality)
+        else:
+            hi = crf - 1   # too low quality -> lower CRF (bigger, higher quality)
+
+        if lo > hi:
+            break
+
+    return best or {"crf": (crf_lo + crf_hi) // 2, "vmaf": None}
+
+
+def per_title_ladder_measured(
+    src: Path,
+    src_meta: Dict[str, Any],
+    target_vmaf: float = 93.0,
+    sample_sec: float = 8.0,
+) -> List[Dict[str, Any]]:
+    """
+    Convex-hull-style ladder: for each candidate rung resolution, measure the
+    CRF that actually hits the target VMAF on a short sample of this specific
+    title, then encode that same sample at the found CRF to read its real
+    bitrate. This replaces the fixed 0.7-1.5x complexity multiplier with an
+    actual rate-distortion measurement per rung, per title — the core idea
+    behind Netflix's per-title encoding and Visionular Aurora's CAE, without
+    requiring their proprietary encoder.
+    """
+    duration = src_meta.get("duration", 0) or 0
+    start = max(0.0, duration / 2 - sample_sec / 2) if duration else 0.0
+
+    rungs = [
+        {"w": 426, "h": 240},
+        {"w": 854, "h": 480},
+        {"w": 1280, "h": 720},
+    ]
+    if src_meta.get("height", 0) >= 1000 and src_meta.get("width", 0) >= 1700:
+        rungs.append({"w": 1920, "h": 1080})
+
+    ladder = []
+    for r in rungs:
+        found = find_crf_for_target_vmaf(
+            src, r["w"], r["h"], target_vmaf, sample_sec, start
+        )
+        crf = found["crf"]
+
+        # Encode the sample once more at the winning CRF to read its bitrate.
+        sid = uuid.uuid4().hex
+        log = LOG_DIR / f"{sid}.log"
+        probe_out = LOG_DIR / f"{sid}_final.mp4"
+        cmd = [
+            ffinfo()["ffmpeg"], "-hide_banner", "-y",
+            "-ss", str(round(start, 2)), "-i", str(src), "-t", str(sample_sec),
+            "-vf", f"scale={r['w']}:{r['h']}:flags=lanczos",
+            "-c:v", "libx264" if has_encoder("libx264") else "h264",
+            "-preset", "veryfast", "-crf", str(crf),
+            "-pix_fmt", "yuv420p", "-an", str(probe_out),
+        ]
+        run_ffmpeg(cmd, log, 300)
+
+        bitrate_kbps = 800
+        if probe_out.exists():
+            size_bits = probe_out.stat().st_size * 8
+            bitrate_kbps = max(150, int(size_bits / max(sample_sec, 0.1) / 1000))
+            try:
+                probe_out.unlink()
+            except Exception:
+                pass
+
+        ladder.append({
+            "Resolution": f"{r['w']}x{r['h']}",
+            "w": r["w"],
+            "h": r["h"],
+            "bitrate_kbps": bitrate_kbps,
+            "crf_used": crf,
+            "measured_vmaf": found.get("vmaf"),
+        })
+
+    return ladder
 
 
 def per_title_ladder(src_meta: Dict[str, Any], complexity: float) -> List[Dict[str, Any]]:
@@ -1753,10 +1991,20 @@ with tab_work:
             with tc4:
                 preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2)
 
+            safety_margin_pct = st.slider(
+                "Safety margin",
+                2, 15, 6,
+                help="Encoder rate-control accuracy plus container overhead means an encode aimed exactly "
+                     "at the cap can occasionally land a little over it. This margin is subtracted before "
+                     "computing the target bitrate — raise it if you're hitting a hard limit (e.g. an "
+                     "upload cap) and can't afford any overshoot.",
+            )
+
             if codec == "AV1":
                 st.caption("ℹ️ AV1 two-pass uses a fixed internal speed setting (cpu-used=6) — the Preset selector above is ignored for AV1.")
 
             crf = None
+            content_tune, cap_peak_bitrate = "Auto", False
 
         else:
             pc1, pc2, pc3 = st.columns(3)
@@ -1798,6 +2046,25 @@ with tab_work:
                     preset_idx = 0
 
                 preset = st.selectbox("Preset override", preset_opts, index=preset_idx)
+
+            tc_col1, tc_col2 = st.columns(2)
+            with tc_col1:
+                content_tune = st.selectbox(
+                    "Content tuning",
+                    ["Auto", "Film / live-action", "Animation", "Screen / UGC-graphics", "Grain-heavy"],
+                    index=0,
+                    help="Adjusts psy-RD / adaptive-quantization behavior per content type — the same "
+                         "idea behind Aurora/CAE 'scene-based optimization' presets, approximated with "
+                         "open x264/x265/SVT-AV1 tuning flags rather than a proprietary model.",
+                )
+            with tc_col2:
+                cap_peak_bitrate = st.checkbox(
+                    "Cap peak bitrate (streaming-safe)",
+                    value=False,
+                    help="Adds -maxrate/-bufsize around the CRF estimate so a single complex scene can't "
+                         "spike the bitrate far past the average — recommended for anything going through "
+                         "a CDN/ABR pipeline with fixed peak-bandwidth budgets.",
+                )
 
             target_mb, target_audio_kbps = None, None
 
@@ -1948,6 +2215,7 @@ with tab_work:
                         preset=preset,
                         target_mb=target_mb,
                         audio_kbps=target_audio_kbps,
+                        safety_margin_pct=safety_margin_pct,
                         denoise=denoise,
                         sharpen=sharpen,
                         deblock=deblock,
@@ -1981,6 +2249,8 @@ with tab_work:
                         image_mode=image_mode,
                         logo_pos=logo_pos,
                         logo_scale=logo_scale,
+                        content_tune=content_tune,
+                        cap_peak_bitrate=cap_peak_bitrate,
                     )
 
                     out_path, log, md = encode_video(
@@ -2003,6 +2273,15 @@ with tab_work:
 
                     if md.get("warning"):
                         st.warning(md["warning"])
+
+                    if is_target_mode:
+                        actual_mb = out_path.stat().st_size / 1048576
+                        if actual_mb > target_mb:
+                            st.warning(
+                                f"⚠️ Output landed at {actual_mb:.2f} MB, over the {target_mb:.1f} MB target "
+                                f"despite the safety margin. Try raising the safety margin or lowering the "
+                                f"target further."
+                            )
 
                     with st.spinner("Computing quality metrics…"):
                         q = quality_metrics(src, out_path, sid, quick=True)
@@ -2402,46 +2681,94 @@ with tab_abr:
         per_title = st.checkbox(
             "🎯 Content-adaptive bitrates",
             value=False,
-            help="Analyzes motion/spatial complexity and scales each rung bitrate.",
+            help="Builds a per-rung bitrate ladder tailored to this specific title instead of a fixed ladder.",
         )
 
         ladder_preview = None
 
         if per_title and src_abr:
-            comp_key = f"complexity_{src_abr.name}_{src_abr.stat().st_mtime}"
+            method = st.radio(
+                "Method",
+                ["⚡ Fast heuristic", "🎯 Measured (VMAF-targeted)"],
+                horizontal=True,
+                help=(
+                    "Fast heuristic: one signalstats motion/detail sample scales all rungs by the same "
+                    "factor — quick but approximate.\n\n"
+                    "Measured: probes each rung resolution with short real encodes and binary-searches "
+                    "the CRF that hits your target VMAF, then reads the actual resulting bitrate — the "
+                    "same rate-distortion-measurement idea behind Netflix per-title encoding and "
+                    "Visionular's Aurora CAE line. Slower (a few short encodes per rung) but reflects "
+                    "this title's real complexity per resolution, not a single global score."
+                ),
+            )
 
-            if st.button("Analyze complexity", use_container_width=False):
-                sid_a = uuid.uuid4().hex
-                sm_a = media(src_abr)
+            if method == "⚡ Fast heuristic":
+                comp_key = f"complexity_{src_abr.name}_{src_abr.stat().st_mtime}"
 
-                with st.spinner("Sampling motion and spatial complexity…"):
-                    score = analyze_complexity(src_abr, sm_a.get("duration", 0), sid_a)
+                if st.button("Analyze complexity", use_container_width=False):
+                    sid_a = uuid.uuid4().hex
+                    sm_a = media(src_abr)
 
-                st.session_state[comp_key] = score
+                    with st.spinner("Sampling motion and spatial complexity…"):
+                        score = analyze_complexity(src_abr, sm_a.get("duration", 0), sid_a)
 
-            score = st.session_state.get(comp_key)
+                    st.session_state[comp_key] = score
 
-            if score is not None:
-                tier = "high motion" if score > 0.66 else ("moderate motion" if score > 0.33 else "low motion")
+                score = st.session_state.get(comp_key)
 
-                st.markdown(
-                    f"<div class='info-strip'>Complexity score: {score:.2f} / 1.00 — {tier} content detected</div>",
-                    unsafe_allow_html=True,
-                )
+                if score is not None:
+                    tier = "high motion" if score > 0.66 else ("moderate motion" if score > 0.33 else "low motion")
 
-                ladder_preview = per_title_ladder(media(src_abr), score)
+                    st.markdown(
+                        f"<div class='info-strip'>Complexity score: {score:.2f} / 1.00 — {tier} content detected</div>",
+                        unsafe_allow_html=True,
+                    )
 
-                st.dataframe(
-                    pd.DataFrame([
-                        {"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"]}
-                        for r in ladder_preview
-                    ]),
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                    ladder_preview = per_title_ladder(media(src_abr), score)
 
-            elif not has_filter("signalstats"):
-                st.warning("This FFmpeg build does not include `signalstats`. Neutral 0.5 complexity ladder will be used.")
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"]}
+                            for r in ladder_preview
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                elif not has_filter("signalstats"):
+                    st.warning("This FFmpeg build does not include `signalstats`. Neutral 0.5 complexity ladder will be used.")
+
+            else:
+                mv1, mv2 = st.columns(2)
+                target_vmaf = mv1.slider("Target VMAF", 80, 98, 93, help="Higher = larger files, more headroom for quality.")
+                sample_sec = mv2.slider("Sample length per probe (s)", 4, 20, 8)
+
+                measured_key = f"measured_ladder_{src_abr.name}_{src_abr.stat().st_mtime}_{target_vmaf}_{sample_sec}"
+
+                if st.button("Run measured per-title analysis", use_container_width=False):
+                    with st.spinner("Probing each resolution rung with short real encodes — this takes a bit longer…"):
+                        st.session_state[measured_key] = per_title_ladder_measured(
+                            src_abr, media(src_abr), float(target_vmaf), float(sample_sec)
+                        )
+
+                ladder_preview = st.session_state.get(measured_key)
+
+                if ladder_preview:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Resolution": r["Resolution"],
+                                "Bitrate kbps": r["bitrate_kbps"],
+                                "CRF used": r.get("crf_used"),
+                                "Measured VMAF": round(r["measured_vmaf"], 1) if r.get("measured_vmaf") else "—",
+                            }
+                            for r in ladder_preview
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if not has_filter("libvmaf"):
+                        st.caption("ℹ️ This FFmpeg build lacks libvmaf — probes used the SSIM-derived VMAF proxy instead of true VMAF.")
 
         if st.button("Generate HLS ABR Ladder", type="primary"):
             if not src_abr:
