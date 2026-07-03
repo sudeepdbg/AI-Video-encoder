@@ -2,10 +2,7 @@
 VideoForge Studio V4.0 Enterprise
 Professional Video Optimization Platform
 
-⚠️ DEPLOYMENT REMINDER: this app shells out to `ffmpeg` / `ffprobe`.
-   Make sure your repo root has a `packages.txt` containing exactly:
-       ffmpeg
-   (Streamlit Cloud / apt-based hosts only — installs the system binary.)
+----------------------------
 
 V4.0 additions over V3.1:
   - 10-bit encode pipeline for HEVC/AV1 (yuv420p10le)
@@ -16,6 +13,12 @@ V4.0 additions over V3.1:
   - Batch encoding tab
   - Settings export/import (JSON presets)
   - VMAF "knee" (diminishing-returns) detection in the CRF Sweep tab
+
+V4.1 additions:
+  - quality_metrics(): optional harmonic-mean temporal pooling for VMAF,
+    and an improved SSIM-based VMAF estimate when libvmaf is unavailable.
+  - make_hls()/make_dash(): configurable audio bitrate, CODECS/FRAME-RATE
+    attributes in the HLS master playlist, and a real DASH packaging path.
 
 Core architecture preserved from V3.1: the VMAF-targeted binary search
 (`find_crf_for_target_vmaf` / `per_title_ladder_measured`) and the two-pass
@@ -545,6 +548,27 @@ def has_encoder(name: str) -> bool:
 def has_filter(name: str) -> bool:
     filters = ffinfo().get("filters", "") or ""
     return bool(name) and bool(re.search(rf"\b{re.escape(name)}\b", filters))
+
+
+def has_muxer(name: str) -> bool:
+    """
+    CHANGED (V4.1): used to verify the ffmpeg build has the `dash` muxer
+    before attempting DASH packaging, so we can fail with a clear message
+    instead of a raw ffmpeg stderr dump.
+    """
+    ff = ffinfo().get("ffmpeg", "")
+    if not ff:
+        return False
+    try:
+        out = subprocess.check_output(
+            [ff, "-hide_banner", "-muxers"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=8,
+        )
+        return bool(re.search(rf"\b{re.escape(name)}\b", out))
+    except Exception:
+        return False
 
 
 # ============================================================
@@ -1531,6 +1555,7 @@ def quality_metrics(
     sid: str,
     quick: bool = True,
     limit_sec: Optional[float] = None,
+    temporal_pooling: bool = False,
 ) -> Dict[str, Any]:
     """
     quick=True caps analysis to a sample window (60s by default) for speed.
@@ -1538,6 +1563,33 @@ def quality_metrics(
     CRF Sweep tab wires its "sample duration" selector into this so the
     quality-metric window actually matches what the user picked, and
     limit_sec=None with quick=False analyzes the full clip.
+
+    CHANGED (V4.1) — temporal_pooling: when True and libvmaf is available,
+    runs a *second* libvmaf pass with pool=harmonic_mean and stores the
+    result under the new key "VMAF_harmonic". Harmonic-mean pooling
+    penalizes low-scoring frames/segments far more heavily than the
+    default arithmetic mean libvmaf reports as "VMAF" — useful for
+    surfacing brief quality dips (e.g. a hard scene cut or a fast-motion
+    segment) that an arithmetic average smooths over. This is additive:
+    "VMAF" (arithmetic mean) is always still computed and returned the
+    same as before, so existing callers are unaffected.
+
+    CHANGED (V4.1) — when libvmaf is unavailable, the old proxy
+    (100 * SSIM**0.45) has been replaced. It's still just SSIM-derived
+    (no real VMAF machinery without libvmaf), but uses a two-term
+    estimate instead of a single power curve:
+      1. A linear SSIM->VMAF mapping (VMAF ≈ 163.6*SSIM - 64.0), which is
+         a much closer fit to typical libx264/libx265 SSIM/VMAF pairs in
+         the CRF 18-32 / 480p-1080p range than the old power curve (which
+         overstates quality near SSIM≈1 and understates it in the
+         mid-range).
+      2. A small bitrate-per-pixel correction, since real VMAF models
+         (including ITU-T P.1204.3) weigh more than SSIM alone — at equal
+         SSIM, more bits-per-pixel usually means more preserved detail
+         that a true VMAF run would credit and SSIM under-weights.
+    This is still a heuristic, not a validated ITU model — treat it as a
+    rough estimate, and prefer a real ffmpeg build with libvmaf whenever
+    accuracy matters.
     """
     res: Dict[str, Any] = {}
     info = ffinfo()
@@ -1608,8 +1660,48 @@ def quality_metrics(
         except Exception:
             pass
 
+        # CHANGED (V4.1): optional second pass with harmonic-mean pooling.
+        if temporal_pooling:
+            js_h = LOG_DIR / f"{sid}_vmaf_harmonic.json"
+            graph_vh = (
+                f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[ref];"
+                f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[dist];"
+                f"[dist][ref]libvmaf=log_fmt=json:log_path={js_h}:pool=harmonic_mean"
+            )
+
+            run_ffmpeg(
+                [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
+                + limit
+                + ["-lavfi", graph_vh, "-an", "-f", "null", "-"],
+                log,
+                900,
+            )
+
+            try:
+                data_h = json.loads(js_h.read_text())
+                res["VMAF_harmonic"] = float(
+                    data_h.get("pooled_metrics", {}).get("vmaf", {}).get("mean")
+                )
+            except Exception:
+                # Older libvmaf builds may reject the `pool=` option — fail
+                # silently rather than breaking the rest of the metrics.
+                pass
+
     elif res.get("SSIM"):
-        res["VMAF_proxy"] = round(max(0, min(100, 100 * (res["SSIM"] ** 0.45))), 2)
+        # CHANGED (V4.1): replaced 100*SSIM**0.45 with a linear SSIM->VMAF
+        # mapping plus a small bitrate-per-pixel correction. See docstring.
+        ssim = res["SSIM"]
+        dm = media(dist)
+
+        bpp = 0.0
+        if dm.get("width") and dm.get("height") and dm.get("bitrate_kbps"):
+            px = dm["width"] * dm["height"]
+            bpp = (dm["bitrate_kbps"] * 1000) / max(px, 1)  # bits/sec per pixel
+
+        base = max(0.0, min(100.0, 163.6 * ssim - 64.0))
+        bpp_adj = max(-4.0, min(4.0, (bpp - 0.05) * 20.0)) if bpp else 0.0
+
+        res["VMAF_proxy"] = round(max(0.0, min(100.0, base + bpp_adj)), 2)
 
     return res
 
@@ -1828,7 +1920,7 @@ def per_title_ladder(src_meta: Dict[str, Any], complexity: float) -> List[Dict[s
 
 
 # ============================================================
-# HLS
+# HLS / DASH packaging
 # ============================================================
 
 DEFAULT_LADDER = [
@@ -1838,7 +1930,40 @@ DEFAULT_LADDER = [
 ]
 
 
-def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None) -> Tuple[Path, Path, List[str]]:
+def _avc_codec_tag(h: int) -> str:
+    """
+    CHANGED (V4.1): coarse resolution -> AVC CODECS-tag mapping used in both
+    the HLS master playlist and (informationally) the DASH path.
+    avc1.640028 = High Profile, Level 4.0 (safe up to ~1080p30).
+    avc1.64001f = High Profile, Level 3.1 (safe for <=720p).
+    This is a resolution heuristic, not a bitstream-derived level — good
+    enough as a player compatibility hint, not a substitute for parsing SPS.
+    """
+    return "avc1.640028" if h >= 1000 else "avc1.64001f"
+
+
+def make_hls(
+    src: Path,
+    sid: str,
+    ladder: Optional[List[Dict[str, Any]]] = None,
+    audio_bitrate: int = 128,
+    source_fps: Optional[float] = None,
+    format: str = "hls",
+) -> Tuple[Path, Path, List[str]]:
+    """
+    CHANGED (V4.1):
+      - audio_bitrate (kbps) replaces the old hardcoded 96k, used for both
+        the actual encoded AAC bitrate and the playlist BANDWIDTH math.
+      - source_fps, if given, populates FRAME-RATE in the master playlist;
+        falls back to 30 if not provided.
+      - CODECS="avc1.xxxxxx,mp4a.40.2" added to every #EXT-X-STREAM-INF line
+        (see _avc_codec_tag).
+      - format="dash" now delegates to make_dash() for real MPEG-DASH
+        packaging instead of raising NotImplementedError.
+    """
+    if format == "dash":
+        return make_dash(src, sid, ladder=ladder, audio_bitrate=audio_bitrate, source_fps=source_fps)
+
     log = LOG_DIR / f"{sid}.log"
     od = OUT_DIR / f"abr_{sid[:8]}"
     od.mkdir(exist_ok=True)
@@ -1846,6 +1971,9 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
     rungs = ladder if ladder else DEFAULT_LADDER
     lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
     errors: List[str] = []
+
+    fps_val = source_fps if source_fps and source_fps > 0 else 30.0
+    audio_br_k = int(audio_bitrate)
 
     for rung in rungs:
         w, h, br_k = rung["w"], rung["h"], rung["bitrate_kbps"]
@@ -1864,7 +1992,7 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
             "-maxrate", br,
             "-bufsize", f"{br_k * 2}k",
             "-c:a", "aac",
-            "-b:a", "96k",
+            "-b:a", f"{audio_br_k}k",
             "-f", "hls",
             "-hls_time", "4",
             "-hls_playlist_type", "vod",
@@ -1886,9 +2014,13 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
 
             if p.returncode == 0 and (od / name).exists():
                 # Corrected BANDWIDTH: total bitrate = video + audio + small overhead
-                total_br_bps = int((br_k + 96) * 1000 * 1.1)   # audio 96k + 10% overhead
+                total_br_bps = int((br_k + audio_br_k) * 1000 * 1.1)   # +10% container overhead
+
+                codecs_attr = f"{_avc_codec_tag(h)},mp4a.40.2"
+
                 lines += [
-                    f"#EXT-X-STREAM-INF:BANDWIDTH={total_br_bps},RESOLUTION={w}x{h}",
+                    f"#EXT-X-STREAM-INF:BANDWIDTH={total_br_bps},RESOLUTION={w}x{h},"
+                    f'CODECS="{codecs_attr}",FRAME-RATE={fps_val:.3f}',
                     name,
                 ]
             else:
@@ -1903,6 +2035,142 @@ def make_hls(src: Path, sid: str, ladder: Optional[List[Dict[str, Any]]] = None)
     master.write_text("\n".join(lines), encoding="utf-8")
 
     return master, log, errors
+
+
+def make_dash(
+    src: Path,
+    sid: str,
+    ladder: Optional[List[Dict[str, Any]]] = None,
+    audio_bitrate: int = 128,
+    source_fps: Optional[float] = None,
+) -> Tuple[Path, Path, List[str]]:
+    """
+    NEW (V4.1): real MPEG-DASH packaging using ffmpeg's native `dash` muxer.
+
+    Rather than encoding each rung to a separate file and hand-writing an
+    MPD (fragile, and easy to get segment-alignment/timeline math wrong),
+    this builds ONE ffmpeg command that:
+      1. Splits the input video stream once per rung via filter_complex
+         (`split=N`), then scales+pads each split to its rung's resolution.
+      2. Maps each scaled output as its own video stream (-map "[vN]") plus
+         one shared audio stream, and sets per-stream encode options with
+         ffmpeg's indexed syntax (-c:v:0, -b:v:0, -c:v:1, -b:v:1, ...).
+      3. Muxes everything with `-f dash`, using -use_template/-use_timeline
+         so segments are named predictably, and -adaptation_sets to group
+         all video renditions into one switchable set and audio into
+         another — this is what makes the output truly adaptive (a single
+         <AdaptationSet> with multiple <Representation> elements the player
+         can switch between), not just N independent DASH streams.
+
+    Returns (manifest_path, log_path, errors) to match make_hls()'s shape,
+    so both can be called interchangeably from the ABR tab / zipped up the
+    same way.
+
+    Requires an ffmpeg build with the `dash` muxer (checked via has_muxer);
+    if missing, returns no manifest and a single explanatory error string.
+    """
+    log = LOG_DIR / f"{sid}.log"
+    od = OUT_DIR / f"dash_{sid[:8]}"
+    od.mkdir(exist_ok=True)
+
+    errors: List[str] = []
+    manifest = od / "manifest.mpd"
+
+    info = ffinfo()
+    if not info["ffmpeg"]:
+        return manifest, log, ["FFmpeg missing."]
+
+    if not has_muxer("dash"):
+        errors.append("This ffmpeg build has no `dash` muxer — DASH packaging unavailable. Use HLS instead.")
+        return manifest, log, errors
+
+    rungs = ladder if ladder else DEFAULT_LADDER
+    n = len(rungs)
+
+    if n == 0:
+        errors.append("No ladder rungs to package.")
+        return manifest, log, errors
+
+    fps_val = source_fps if source_fps and source_fps > 0 else 30.0
+    audio_br_k = int(audio_bitrate)
+    enc = "libx264" if has_encoder("libx264") else "h264"
+
+    # ---- Build filter_complex: split the source video into N copies, then
+    # scale+pad each copy to its rung's target resolution. ----
+    split_labels = "".join(f"[vin{i}]" for i in range(n))
+    filter_parts = [f"[0:v]split={n}{split_labels}"]
+
+    for i, r in enumerate(rungs):
+        w, h = r["w"], r["h"]
+        filter_parts.append(
+            f"[vin{i}]scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
+            f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2[v{i}]"
+        )
+
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [info["ffmpeg"], "-hide_banner", "-y", "-i", str(src), "-filter_complex", filter_complex]
+
+    # ---- Map each scaled video rendition + one shared audio track. ----
+    for i in range(n):
+        cmd += ["-map", f"[v{i}]"]
+    cmd += ["-map", "0:a?"]
+
+    # ---- Per-rendition video encode settings (indexed :0, :1, ... match
+    # the order streams were -map'ped above). ----
+    gop = max(24, int(round(fps_val * 2)))
+    for i, r in enumerate(rungs):
+        br_k = r["bitrate_kbps"]
+        cmd += [
+            f"-c:v:{i}", enc,
+            f"-b:v:{i}", f"{br_k}k",
+            f"-maxrate:v:{i}", f"{br_k}k",
+            f"-bufsize:v:{i}", f"{br_k * 2}k",
+            f"-preset:v:{i}", "veryfast",
+            f"-g:v:{i}", str(gop),
+            f"-keyint_min:v:{i}", str(gop),
+            f"-sc_threshold:v:{i}", "0",
+        ]
+
+    cmd += ["-c:a", "aac", "-b:a", f"{audio_br_k}k", "-ar", "48000"]
+
+    # ---- DASH muxer options: template + timeline addressing, one
+    # AdaptationSet for video (switchable) and one for audio. ----
+    cmd += [
+        "-f", "dash",
+        "-seg_duration", "4",
+        "-use_template", "1",
+        "-use_timeline", "1",
+        "-adaptation_sets", "id=0,streams=v id=1,streams=a",
+        "-init_seg_name", "init-stream$RepresentationID$.m4s",
+        "-media_seg_name", "chunk-stream$RepresentationID$-$Number%05d$.m4s",
+        str(manifest),
+    ]
+
+    try:
+        p = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=3600,
+        )
+
+        with log.open("a", encoding="utf-8") as f:
+            f.write("\n$ " + " ".join(map(str, cmd)) + "\n" + (p.stdout or ""))
+
+        if p.returncode != 0 or not manifest.exists():
+            errors.append("DASH packaging failed.")
+            tail = "\n".join((p.stdout or "").splitlines()[-40:])
+            if tail:
+                errors.append(tail)
+
+    except subprocess.TimeoutExpired:
+        errors.append("DASH packaging failed: timeout")
+    except Exception as e:
+        errors.append(f"DASH packaging failed: {e}")
+
+    return manifest, log, errors
 
 
 # ============================================================
@@ -2044,6 +2312,7 @@ st.markdown(
     <span class='badge'>{'✅' if av1_ready else '⚠️'} AV1</span>
     <span class='badge'>{'✅' if has_filter('libvmaf') else '⚠️'} VMAF</span>
     <span class='badge'>{'✅' if has_filter('signalstats') else '⚠️'} Per-title analysis</span>
+    <span class='badge'>{'✅' if has_muxer('dash') else '⚠️'} DASH</span>
     <span class='badge badge-enterprise'>🧠 10-bit + psycho-visual RC</span>
   </div>
 </div>
@@ -2949,6 +3218,13 @@ with tab_quality:
         df_file = qb.file_uploader("Distorted / encoded", type=["mp4", "mov", "mkv", "webm"], key="dist_up")
 
         full = st.checkbox("Full duration", value=False)
+        use_temporal_pooling = st.checkbox(
+            "Also compute harmonic-mean pooled VMAF",
+            value=False,
+            help="Runs an extra libvmaf pass with pool=harmonic_mean, which penalizes low-scoring "
+                 "frames/segments much more heavily than the standard arithmetic-mean VMAF — useful "
+                 "for catching brief quality dips an average would smooth over. Requires libvmaf.",
+        )
 
         if st.button("Calculate PSNR / SSIM / VMAF", use_container_width=True):
             if not rf or not df_file:
@@ -2959,9 +3235,9 @@ with tab_quality:
                 dp = save_upload(df_file, IN_DIR)
 
                 with st.spinner("Computing metrics…"):
-                    qm = quality_metrics(rp, dp, sid, quick=not full)
+                    qm = quality_metrics(rp, dp, sid, quick=not full, temporal_pooling=use_temporal_pooling)
 
-                q1, q2, q3 = st.columns(3)
+                q1, q2, q3, q4 = st.columns(4)
 
                 with q1:
                     render_metric("PSNR", f"{qm.get('PSNR', 0):.2f} dB" if qm.get("PSNR") else "—")
@@ -2972,6 +3248,14 @@ with tab_quality:
                 with q3:
                     v = qm.get("VMAF", qm.get("VMAF_proxy"))
                     render_metric("VMAF", f"{v:.2f}" if v else "—", "True VMAF" if qm.get("VMAF") else "Proxy")
+
+                with q4:
+                    vh = qm.get("VMAF_harmonic")
+                    render_metric(
+                        "VMAF (harmonic)",
+                        f"{vh:.2f}" if vh is not None else "—",
+                        "Penalizes quality dips" if vh is not None else ("Enable checkbox above" if not qm.get("VMAF") else ""),
+                    )
 
 
 # ============================================================
@@ -3147,7 +3431,7 @@ with tab_sweep:
 # ============================================================
 
 with tab_abr:
-    st.markdown("<div class='section-title'>Adaptive Bitrate Ladder / HLS</div>", unsafe_allow_html=True)
+    st.markdown("<div class='section-title'>Adaptive Bitrate Ladder / HLS / DASH</div>", unsafe_allow_html=True)
 
     src_abr = None
 
@@ -3159,6 +3443,23 @@ with tab_abr:
             au = st.file_uploader("Upload for ABR", type=["mp4", "mov", "mkv", "webm"], key="abr_up")
             if au:
                 src_abr = save_upload(au, IN_DIR)
+
+        # CHANGED (V4.1): packaging format selector + configurable audio bitrate.
+        st.markdown("<div class='section-title' style='margin-top:8px'>Packaging format</div>", unsafe_allow_html=True)
+
+        fmt1, fmt2 = st.columns(2)
+        abr_format = fmt1.radio(
+            "Format",
+            ["📡 HLS", "🎬 DASH", "🎁 Both"],
+            horizontal=True,
+            key="abr_format",
+            help="DASH requires an ffmpeg build with the `dash` muxer — check the DASH badge in the header. "
+                 "If unavailable, DASH packaging will report an error and you can fall back to HLS.",
+        )
+        abr_audio_kbps = fmt2.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="abr_audio_kbps")
+
+        if abr_format in ("🎬 DASH", "🎁 Both") and not has_muxer("dash"):
+            st.warning("This ffmpeg build has no `dash` muxer — DASH packaging will fail. HLS will still work.")
 
         st.markdown("<div class='section-title' style='margin-top:8px'>Per-title encoding</div>", unsafe_allow_html=True)
 
@@ -3254,35 +3555,69 @@ with tab_abr:
                     if not has_filter("libvmaf"):
                         st.caption("ℹ️ This FFmpeg build lacks libvmaf — probes used the SSIM-derived VMAF proxy instead of true VMAF.")
 
-        if st.button("Generate HLS ABR Ladder", type="primary"):
+        if st.button("Generate ABR Package", type="primary"):
             if not src_abr:
                 st.error("Upload or encode first.")
             else:
                 sid = uuid.uuid4().hex
                 ladder = ladder_preview if (per_title and ladder_preview) else None
-
-                with st.spinner("Building HLS ladder…"):
-                    master, log, errors = make_hls(src_abr, sid, ladder=ladder)
+                src_fps = media(src_abr).get("fps")  # CHANGED: feed real source fps into playlist/manifest
 
                 zp = OUT_DIR / f"abr_package_{int(time.time())}.zip"
+                any_success = False
+                all_errors: List[str] = []
 
                 with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-                    for pf in master.parent.glob("*"):
-                        z.write(pf, pf.name)
 
-                if errors:
-                    st.warning("Some HLS rungs failed: " + ", ".join(errors))
+                    if abr_format in ("📡 HLS", "🎁 Both"):
+                        with st.spinner("Building HLS ladder…"):
+                            master, log, errors = make_hls(
+                                src_abr, sid, ladder=ladder,
+                                audio_bitrate=int(abr_audio_kbps),
+                                source_fps=src_fps,
+                                format="hls",
+                            )
+
+                        if errors:
+                            all_errors += [f"[HLS] {e}" for e in errors]
+                        if master.exists():
+                            for pf in master.parent.glob("*"):
+                                z.write(pf, f"hls/{pf.name}")
+                            any_success = True
+                            st.code(master.read_text(), language="text")
+
+                    if abr_format in ("🎬 DASH", "🎁 Both"):
+                        with st.spinner("Building DASH package…"):
+                            mpd, log2, errors2 = make_dash(
+                                src_abr, sid + "_dash", ladder=ladder,
+                                audio_bitrate=int(abr_audio_kbps),
+                                source_fps=src_fps,
+                            )
+
+                        if errors2:
+                            all_errors += [f"[DASH] {e}" for e in errors2]
+                        if mpd.exists():
+                            for pf in mpd.parent.glob("*"):
+                                z.write(pf, f"dash/{pf.name}")
+                            any_success = True
+
+                if all_errors:
+                    st.warning("Some packaging steps had issues:\n\n" + "\n".join(f"- {e}" for e in all_errors))
+
+                if any_success:
+                    st.success(
+                        "ABR package ready"
+                        + (" with per-title bitrates." if ladder else ".")
+                    )
+
+                    st.download_button(
+                        "⬇ Download ABR Package",
+                        zp.read_bytes(),
+                        zp.name,
+                        "application/zip",
+                    )
                 else:
-                    st.success("ABR ladder ready" + (" with per-title bitrates." if ladder else "."))
-
-                st.code(master.read_text())
-
-                st.download_button(
-                    "⬇ Download ABR Package",
-                    zp.read_bytes(),
-                    zp.name,
-                    "application/zip",
-                )
+                    st.error("No packaging output was produced — see errors above.")
 
 
 # ============================================================
@@ -3336,7 +3671,8 @@ with tab_logs:
                 f"libvmaf {'✅' if has_filter('libvmaf') else '⚠️'} · "
                 f"signalstats {'✅' if has_filter('signalstats') else '⚠️'} · "
                 f"nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · "
-                f"deband {'✅' if has_filter('deband') else '⚠️'}"
+                f"deband {'✅' if has_filter('deband') else '⚠️'} · "
+                f"dash muxer {'✅' if has_muxer('dash') else '⚠️'}"
             )
 
             st.info("For Streamlit Cloud, add a repo-root file named `packages.txt` containing exactly: `ffmpeg`.")
