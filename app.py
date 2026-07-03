@@ -2237,40 +2237,24 @@ def toast(msg: str, icon: str = "✅"):
         pass
 
 
+# ============================================================
+# FIXED: video player - now always uses st.video to avoid truncation
+# ============================================================
 def player(path: Path, poster: Optional[Path], mime: str):
     """
-    Universal inline player. IMPORTANT: the <video> element must contain a
-    proper <source> tag — if it doesn't, browsers fall back to rendering the
-    element's raw text content, which here would be a multi-megabyte base64
-    string dumped visibly into the page.
+    Universal inline player. Uses st.video which automatically sizes correctly
+    and avoids truncation issues seen with custom HTML iframes.
     """
     if not path or not path.exists():
         return
 
-    inline_limit_mb = 25
-
-    if path.stat().st_size > inline_limit_mb * 1024 * 1024:
-        st.video(str(path))
-        return
-
-    vb64 = base64.b64encode(path.read_bytes()).decode()
-    pa = ""
-
+    poster_url = None
     if poster and poster.exists() and poster.stat().st_size < 5 * 1024 * 1024:
         pm = "image/png" if poster.suffix.lower() == ".png" else "image/jpeg"
-        pa = f"poster='data:{pm};base64,{base64.b64encode(poster.read_bytes()).decode()}'"
+        poster_url = f"data:{pm};base64,{base64.b64encode(poster.read_bytes()).decode()}"
 
-    components.html(
-        f"""
-        <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
-            <video controls preload='metadata' style='width:100%;max-height:520px;background:#000;border-radius:10px' {pa}>
-                <source src='data:{mime};base64,{vb64}' type='{mime}'>
-                Your browser does not support inline video playback.
-            </video>
-        </div>
-        """,
-        height=None,
-    )
+    # st.video accepts a poster parameter (URL) in recent versions.
+    st.video(str(path), poster=poster_url)
 
 
 # ============================================================
