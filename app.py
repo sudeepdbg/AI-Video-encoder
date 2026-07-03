@@ -2,7 +2,10 @@
 VideoForge Studio V4.0 Enterprise
 Professional Video Optimization Platform
 
-----------------------------
+⚠️ DEPLOYMENT REMINDER: this app shells out to `ffmpeg` / `ffprobe`.
+   Make sure your repo root has a `packages.txt` containing exactly:
+       ffmpeg
+   (Streamlit Cloud / apt-based hosts only — installs the system binary.)
 
 V4.0 additions over V3.1:
   - 10-bit encode pipeline for HEVC/AV1 (yuv420p10le)
@@ -2243,6 +2246,17 @@ def player(path: Path, poster: Optional[Path], mime: str):
     proper <source> tag — if it doesn't, browsers fall back to rendering the
     element's raw text content, which here would be a multi-megabyte base64
     string dumped visibly into the page.
+
+    CHANGED (V4.2): components.html() does NOT auto-size to its content —
+    passing height=None silently falls back to Streamlit's small default
+    iframe height, which was clipping/cropping the video vertically (it
+    looked "zoomed in" because only the middle slice of the frame was ever
+    visible). Fixed by:
+      1. Giving components.html an explicit numeric height.
+      2. Sizing the container from the video's real aspect ratio (via
+         media()) and using object-fit:contain inside a centered flexbox,
+         so the whole frame is always visible — letterboxed if needed —
+         regardless of the source's aspect ratio (16:9, 9:16, square, etc).
     """
     if not path or not path.exists():
         return
@@ -2260,16 +2274,33 @@ def player(path: Path, poster: Optional[Path], mime: str):
         pm = "image/png" if poster.suffix.lower() == ".png" else "image/jpeg"
         pa = f"poster='data:{pm};base64,{base64.b64encode(poster.read_bytes()).decode()}'"
 
+    # CHANGED (V4.2): compute a real display height from the video's own
+    # aspect ratio instead of relying on CSS width:100%/height:auto inside
+    # an unsized iframe (which was the root cause of the cropping).
+    vmeta = media(path)
+    vw, vh = vmeta.get("width") or 16, vmeta.get("height") or 9
+    aspect = vh / vw if vw else 9 / 16
+
+    max_display_h = 520
+    chrome_px = 24  # container padding (10px) + border (2px), top and bottom
+
+    display_h = min(max_display_h, int(720 * aspect))  # 720 ~= a typical rendered column width
+    display_h = max(display_h, 200)  # sane floor for very wide/short (e.g. ultra-panoramic) sources
+    iframe_h = display_h + chrome_px
+
     components.html(
         f"""
-        <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
-            <video controls preload='metadata' style='width:100%;max-height:520px;background:#000;border-radius:10px' {pa}>
+        <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;
+            padding:10px;box-sizing:border-box;height:{display_h + chrome_px}px;
+            display:flex;align-items:center;justify-content:center;overflow:hidden;'>
+            <video controls preload='metadata' style='max-width:100%;max-height:100%;width:auto;height:auto;
+                background:#000;border-radius:10px;object-fit:contain;' {pa}>
                 <source src='data:{mime};base64,{vb64}' type='{mime}'>
                 Your browser does not support inline video playback.
             </video>
         </div>
         """,
-        height=None,
+        height=iframe_h,
     )
 
 
@@ -3561,11 +3592,12 @@ with tab_abr:
             else:
                 sid = uuid.uuid4().hex
                 ladder = ladder_preview if (per_title and ladder_preview) else None
-                src_fps = media(src_abr).get("fps")  # CHANGED: feed real source fps into playlist/manifest
+                src_fps = media(src_abr).get("fps")  # feed real source fps into playlist/manifest
 
                 zp = OUT_DIR / f"abr_package_{int(time.time())}.zip"
                 any_success = False
                 all_errors: List[str] = []
+                zipped_files: List[str] = []   # CHANGED: track exactly what's in the zip, for display below
 
                 with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
 
@@ -3582,9 +3614,10 @@ with tab_abr:
                             all_errors += [f"[HLS] {e}" for e in errors]
                         if master.exists():
                             for pf in master.parent.glob("*"):
-                                z.write(pf, f"hls/{pf.name}")
+                                arcname = f"hls/{pf.name}"
+                                z.write(pf, arcname)
+                                zipped_files.append(arcname)
                             any_success = True
-                            st.code(master.read_text(), language="text")
 
                     if abr_format in ("🎬 DASH", "🎁 Both"):
                         with st.spinner("Building DASH package…"):
@@ -3598,7 +3631,9 @@ with tab_abr:
                             all_errors += [f"[DASH] {e}" for e in errors2]
                         if mpd.exists():
                             for pf in mpd.parent.glob("*"):
-                                z.write(pf, f"dash/{pf.name}")
+                                arcname = f"dash/{pf.name}"
+                                z.write(pf, arcname)
+                                zipped_files.append(arcname)
                             any_success = True
 
                 if all_errors:
@@ -3610,11 +3645,34 @@ with tab_abr:
                         + (" with per-title bitrates." if ladder else ".")
                     )
 
+                    # CHANGED (V4.2): preview both manifests inline (previously only HLS
+                    # got a st.code() preview) and list every file the zip contains, so
+                    # it's obvious where the HLS and DASH output actually live before
+                    # you download or unzip anything.
+                    if abr_format in ("📡 HLS", "🎁 Both") and master.exists():
+                        with st.expander("📡 HLS — master.m3u8", expanded=True):
+                            st.code(master.read_text(), language="text")
+                            st.caption(f"Segments alongside it in the zip under `hls/` ({len([f for f in zipped_files if f.startswith('hls/')])} files).")
+
+                    if abr_format in ("🎬 DASH", "🎁 Both") and mpd.exists():
+                        with st.expander("🎬 DASH — manifest.mpd", expanded=True):
+                            st.code(mpd.read_text(), language="xml")
+                            st.caption(f"Init/media segments alongside it in the zip under `dash/` ({len([f for f in zipped_files if f.startswith('dash/')])} files).")
+
+                    with st.expander("📁 Full zip contents"):
+                        st.code("\n".join(sorted(zipped_files)), language="text")
+
                     st.download_button(
                         "⬇ Download ABR Package",
                         zp.read_bytes(),
                         zp.name,
                         "application/zip",
+                    )
+
+                    st.caption(
+                        "To test playback locally: `ffplay hls/master.m3u8` or `ffplay dash/manifest.mpd`, "
+                        "or drop the unzipped folder into a local server and open it with hls.js / dash.js / "
+                        "a player like VLC or Shaka Player."
                     )
                 else:
                     st.error("No packaging output was produced — see errors above.")
