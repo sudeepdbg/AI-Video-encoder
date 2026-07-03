@@ -2237,19 +2237,40 @@ def toast(msg: str, icon: str = "✅"):
         pass
 
 
-# ============================================================
-# FIXED: video player - uses st.video without unsupported poster parameter
-# ============================================================
 def player(path: Path, poster: Optional[Path], mime: str):
     """
-    Universal inline player. Uses st.video which automatically sizes correctly
-    and avoids truncation issues seen with custom HTML iframes.
-    The 'poster' parameter is ignored because older Streamlit versions do not
-    support it.
+    Universal inline player. IMPORTANT: the <video> element must contain a
+    proper <source> tag — if it doesn't, browsers fall back to rendering the
+    element's raw text content, which here would be a multi-megabyte base64
+    string dumped visibly into the page.
     """
     if not path or not path.exists():
         return
-    st.video(str(path))
+
+    inline_limit_mb = 25
+
+    if path.stat().st_size > inline_limit_mb * 1024 * 1024:
+        st.video(str(path))
+        return
+
+    vb64 = base64.b64encode(path.read_bytes()).decode()
+    pa = ""
+
+    if poster and poster.exists() and poster.stat().st_size < 5 * 1024 * 1024:
+        pm = "image/png" if poster.suffix.lower() == ".png" else "image/jpeg"
+        pa = f"poster='data:{pm};base64,{base64.b64encode(poster.read_bytes()).decode()}'"
+
+    components.html(
+        f"""
+        <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;padding:10px;'>
+            <video controls preload='metadata' style='width:100%;max-height:520px;background:#000;border-radius:10px' {pa}>
+                <source src='data:{mime};base64,{vb64}' type='{mime}'>
+                Your browser does not support inline video playback.
+            </video>
+        </div>
+        """,
+        height=None,
+    )
 
 
 # ============================================================
@@ -3272,4 +3293,396 @@ with tab_sweep:
             "Sweep sample duration",
             ["30", "60", "120", "Full"],
             index=1,
-            help="Each CRF step encodes only this many seconds of the source (from the start), and quality metrics are computed over the same window — keeps sweeps fast on
+            help="Each CRF step encodes only this many seconds of the source (from the start), and quality metrics are computed over the same window — keeps sweeps fast on long clips. Choose Full to encode and measure the entire source.",
+        )
+        trim_val: Optional[float] = None if sweep_sample == "Full" else float(sweep_sample)
+
+        st.info(
+            "Sweep uses the existing encoder path. For very long files, use 30s or 60s sampling to avoid heavy cloud workloads."
+        )
+
+        if st.button("🚀 Run CRF Sweep", type="primary"):
+            if not src_path:
+                st.error("Upload a source first.")
+            else:
+                src = Path(src_path)
+                sm = media(src)
+                crfs = list(range(int(sw_start), int(sw_end) + 1, int(sw_step)))
+                rows = []
+                prog = st.progress(0, text="Starting sweep…")
+
+                for i, cval in enumerate(crfs):
+                    sid = uuid.uuid4().hex
+
+                    opts = dict(
+                        codec=sw_codec,
+                        crf=cval,
+                        preset="fast" if sw_codec != "AV1" else "6",
+                        profile=sw_profile,
+                        denoise=False,
+                        sharpen=False,
+                        deblock=False,
+                        color=False,
+                        hdr_sdr=False,
+                        interp=False,
+                        scale_to="Source",
+                        image_mode="Ignore image",
+                        logo_pos="Top right",
+                        logo_scale=14,
+                    )
+
+                    out_p, log, md = encode_video(
+                        src,
+                        None,
+                        opts,
+                        sm,
+                        sid,
+                        cb=lambda p, t, i=i: prog.progress(
+                            min(0.99, (i + p) / len(crfs)),
+                            text=f"CRF {cval} · {t}",
+                        ),
+                        trim_seconds=trim_val,
+                    )
+
+                    if out_p:
+                        qm = quality_metrics(
+                            src, out_p, sid,
+                            quick=(trim_val is not None),
+                            limit_sec=trim_val,
+                        )
+                        dm = media(out_p)
+
+                        rows.append({
+                            "CRF": cval,
+                            "Size MB": round(dm["size_mb"], 2),
+                            "Bitrate kbps": round(dm["bitrate_kbps"]),
+                            "PSNR": qm.get("PSNR"),
+                            "SSIM": qm.get("SSIM"),
+                            "VMAF": qm.get("VMAF", qm.get("VMAF_proxy")),
+                            "Encoder": md.get("actual_encoder", ""),
+                            "File": out_p.name,
+                        })
+
+                prog.progress(1.0, text="Sweep complete")
+
+                if rows:
+                    df = pd.DataFrame(rows)
+                    st.dataframe(df, use_container_width=True)
+
+                    chart_cols = [c for c in ["Size MB", "VMAF", "SSIM"] if c in df.columns and df[c].notna().any()]
+                    if chart_cols:
+                        st.line_chart(df.set_index("CRF")[chart_cols])
+
+                    # ---- VMAF knee (diminishing-returns) detection ----
+                    # For each consecutive pair of sweep points we effectively have the
+                    # marginal quality gained per extra MB spent (dVMAF/dSize). Rather than
+                    # pick an arbitrary slope threshold, we find the point of maximum
+                    # perpendicular distance from the line connecting the cheapest/lowest-
+                    # quality point to the most expensive/highest-quality point — the
+                    # standard "elbow" construction — which identifies where a further
+                    # bitrate increase buys the least additional VMAF per MB.
+                    knee_row = None
+                    dknee = df.dropna(subset=["VMAF", "Size MB"]).sort_values("CRF").reset_index(drop=True)
+
+                    if len(dknee) >= 3:
+                        x = dknee["Size MB"].to_numpy(dtype=float)
+                        y = dknee["VMAF"].to_numpy(dtype=float)
+
+                        with np.errstate(divide="ignore", invalid="ignore"):
+                            marginal_vmaf_per_mb = np.diff(y) / np.diff(x)
+
+                        x_range = x.max() - x.min()
+                        y_range = y.max() - y.min()
+
+                        if x_range > 1e-9 and y_range > 1e-9:
+                            xn = (x - x.min()) / x_range
+                            yn = (y - y.min()) / y_range
+
+                            x1, y1, x2, y2 = xn[0], yn[0], xn[-1], yn[-1]
+                            num = np.abs((y2 - y1) * xn - (x2 - x1) * yn + x2 * y1 - y2 * x1)
+                            den = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2) + 1e-9
+                            dist = num / den
+
+                            knee_idx = int(np.argmax(dist))
+                            knee_row = dknee.iloc[knee_idx]
+
+                    if knee_row is not None:
+                        st.markdown(
+                            f"<div class='ok-strip'>🦵 <b>Mathematically optimal CRF ≈ {int(knee_row['CRF'])}</b> "
+                            f"— {knee_row['Size MB']:.2f} MB at VMAF {knee_row['VMAF']:.1f}. "
+                            f"This is the knee of the rate-distortion curve for this specific video: below this "
+                            f"CRF you're spending disproportionately more bits for diminishing VMAF gains; above "
+                            f"it, quality starts dropping faster than size savings justify.</div>",
+                            unsafe_allow_html=True,
+                        )
+                    elif len(dknee) < 3:
+                        st.caption("ℹ️ Knee detection needs at least 3 CRF points with measured VMAF — widen the sweep range or reduce the step to enable it.")
+
+                    st.download_button(
+                        "⬇ Download CSV",
+                        df.to_csv(index=False).encode(),
+                        "crf_sweep.csv",
+                        "text/csv",
+                    )
+
+
+# ============================================================
+# ABR tab
+# ============================================================
+
+with tab_abr:
+    st.markdown("<div class='section-title'>Adaptive Bitrate Ladder / HLS / DASH</div>", unsafe_allow_html=True)
+
+    src_abr = None
+
+    with st.container(border=True):
+        if st.session_state.out and Path(st.session_state.out).exists():
+            src_abr = Path(st.session_state.out)
+            st.caption(f"Using latest output: {src_abr.name}")
+        else:
+            au = st.file_uploader("Upload for ABR", type=["mp4", "mov", "mkv", "webm"], key="abr_up")
+            if au:
+                src_abr = save_upload(au, IN_DIR)
+
+        # CHANGED (V4.1): packaging format selector + configurable audio bitrate.
+        st.markdown("<div class='section-title' style='margin-top:8px'>Packaging format</div>", unsafe_allow_html=True)
+
+        fmt1, fmt2 = st.columns(2)
+        abr_format = fmt1.radio(
+            "Format",
+            ["📡 HLS", "🎬 DASH", "🎁 Both"],
+            horizontal=True,
+            key="abr_format",
+            help="DASH requires an ffmpeg build with the `dash` muxer — check the DASH badge in the header. "
+                 "If unavailable, DASH packaging will report an error and you can fall back to HLS.",
+        )
+        abr_audio_kbps = fmt2.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="abr_audio_kbps")
+
+        if abr_format in ("🎬 DASH", "🎁 Both") and not has_muxer("dash"):
+            st.warning("This ffmpeg build has no `dash` muxer — DASH packaging will fail. HLS will still work.")
+
+        st.markdown("<div class='section-title' style='margin-top:8px'>Per-title encoding</div>", unsafe_allow_html=True)
+
+        per_title = st.checkbox(
+            "🎯 Content-adaptive bitrates",
+            value=False,
+            help="Builds a per-rung bitrate ladder tailored to this specific title instead of a fixed ladder.",
+        )
+
+        ladder_preview = None
+
+        if per_title and src_abr:
+            method = st.radio(
+                "Method",
+                ["⚡ Fast heuristic", "🎯 Measured (VMAF-targeted)"],
+                horizontal=True,
+                help=(
+                    "Fast heuristic: one signalstats motion/detail sample scales all rungs by the same "
+                    "factor — quick but approximate.\n\n"
+                    "Measured: probes each rung resolution with short real encodes and binary-searches "
+                    "the CRF that hits your target VMAF, then reads the actual resulting bitrate — the "
+                    "same rate-distortion-measurement idea behind Netflix per-title encoding and "
+                    "Visionular's Aurora CAE line. Slower (a few short encodes per rung) but reflects "
+                    "this title's real complexity per resolution, not a single global score."
+                ),
+            )
+
+            if method == "⚡ Fast heuristic":
+                comp_key = f"complexity_{src_abr.name}_{src_abr.stat().st_mtime}"
+
+                if st.button("Analyze complexity", use_container_width=False):
+                    sid_a = uuid.uuid4().hex
+                    sm_a = media(src_abr)
+
+                    with st.spinner("Sampling motion and spatial complexity…"):
+                        score = analyze_complexity(src_abr, sm_a.get("duration", 0), sid_a)
+
+                    st.session_state[comp_key] = score
+
+                score = st.session_state.get(comp_key)
+
+                if score is not None:
+                    tier = "high motion" if score > 0.66 else ("moderate motion" if score > 0.33 else "low motion")
+
+                    st.markdown(
+                        f"<div class='info-strip'>Complexity score: {score:.2f} / 1.00 — {tier} content detected</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    ladder_preview = per_title_ladder(media(src_abr), score)
+
+                    st.dataframe(
+                        pd.DataFrame([
+                            {"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"]}
+                            for r in ladder_preview
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                elif not has_filter("signalstats"):
+                    st.warning("This FFmpeg build does not include `signalstats`. Neutral 0.5 complexity ladder will be used.")
+
+            else:
+                mv1, mv2 = st.columns(2)
+                target_vmaf = mv1.slider("Target VMAF", 80, 98, 93, help="Higher = larger files, more headroom for quality.")
+                sample_sec = mv2.slider("Sample length per probe (s)", 4, 20, 8)
+
+                measured_key = f"measured_ladder_{src_abr.name}_{src_abr.stat().st_mtime}_{target_vmaf}_{sample_sec}"
+
+                if st.button("Run measured per-title analysis", use_container_width=False):
+                    with st.spinner("Probing each resolution rung with short real encodes — this takes a bit longer…"):
+                        st.session_state[measured_key] = per_title_ladder_measured(
+                            src_abr, media(src_abr), float(target_vmaf), float(sample_sec)
+                        )
+
+                ladder_preview = st.session_state.get(measured_key)
+
+                if ladder_preview:
+                    st.dataframe(
+                        pd.DataFrame([
+                            {
+                                "Resolution": r["Resolution"],
+                                "Bitrate kbps": r["bitrate_kbps"],
+                                "CRF used": r.get("crf_used"),
+                                "Measured VMAF": round(r["measured_vmaf"], 1) if r.get("measured_vmaf") else "—",
+                            }
+                            for r in ladder_preview
+                        ]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    if not has_filter("libvmaf"):
+                        st.caption("ℹ️ This FFmpeg build lacks libvmaf — probes used the SSIM-derived VMAF proxy instead of true VMAF.")
+
+        if st.button("Generate ABR Package", type="primary"):
+            if not src_abr:
+                st.error("Upload or encode first.")
+            else:
+                sid = uuid.uuid4().hex
+                ladder = ladder_preview if (per_title and ladder_preview) else None
+                src_fps = media(src_abr).get("fps")  # CHANGED: feed real source fps into playlist/manifest
+
+                zp = OUT_DIR / f"abr_package_{int(time.time())}.zip"
+                any_success = False
+                all_errors: List[str] = []
+
+                with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+
+                    if abr_format in ("📡 HLS", "🎁 Both"):
+                        with st.spinner("Building HLS ladder…"):
+                            master, log, errors = make_hls(
+                                src_abr, sid, ladder=ladder,
+                                audio_bitrate=int(abr_audio_kbps),
+                                source_fps=src_fps,
+                                format="hls",
+                            )
+
+                        if errors:
+                            all_errors += [f"[HLS] {e}" for e in errors]
+                        if master.exists():
+                            for pf in master.parent.glob("*"):
+                                z.write(pf, f"hls/{pf.name}")
+                            any_success = True
+                            st.code(master.read_text(), language="text")
+
+                    if abr_format in ("🎬 DASH", "🎁 Both"):
+                        with st.spinner("Building DASH package…"):
+                            mpd, log2, errors2 = make_dash(
+                                src_abr, sid + "_dash", ladder=ladder,
+                                audio_bitrate=int(abr_audio_kbps),
+                                source_fps=src_fps,
+                            )
+
+                        if errors2:
+                            all_errors += [f"[DASH] {e}" for e in errors2]
+                        if mpd.exists():
+                            for pf in mpd.parent.glob("*"):
+                                z.write(pf, f"dash/{pf.name}")
+                            any_success = True
+
+                if all_errors:
+                    st.warning("Some packaging steps had issues:\n\n" + "\n".join(f"- {e}" for e in all_errors))
+
+                if any_success:
+                    st.success(
+                        "ABR package ready"
+                        + (" with per-title bitrates." if ladder else ".")
+                    )
+
+                    st.download_button(
+                        "⬇ Download ABR Package",
+                        zp.read_bytes(),
+                        zp.name,
+                        "application/zip",
+                    )
+                else:
+                    st.error("No packaging output was produced — see errors above.")
+
+
+# ============================================================
+# Logs tab
+# ============================================================
+
+with tab_logs:
+    st.markdown("<div class='section-title'>Session Logs</div>", unsafe_allow_html=True)
+
+    csv_p = LOG_DIR / "sessions.csv"
+
+    with st.container(border=True):
+        if csv_p.exists():
+            df = pd.read_csv(csv_p)
+            st.dataframe(df.tail(200), use_container_width=True)
+
+            st.download_button(
+                "⬇ Download sessions CSV",
+                csv_p.read_bytes(),
+                "sessions.csv",
+                "text/csv",
+            )
+        else:
+            st.info("No sessions yet.")
+
+        logs = sorted(LOG_DIR.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
+
+        if logs:
+            sel = st.selectbox("Log file", logs, format_func=lambda x: x.name)
+            st.text_area("Preview", sel.read_text(errors="ignore")[-10000:], height=320)
+
+            st.download_button(
+                "⬇ Download selected log",
+                sel.read_bytes(),
+                sel.name,
+                "text/plain",
+            )
+
+    with st.container(border=True):
+        with st.expander("🔧 Diagnostics"):
+            st.write("FFmpeg:", "✅ Ready" if info["ffmpeg"] else "❌ Missing")
+            st.caption(info.get("version", ""))
+
+            st.write("FFprobe:", "✅ Ready" if info["ffprobe"] else "❌ Missing")
+
+            st.write(
+                f"x264 {'✅' if has_encoder('libx264') else '⚠️'} · "
+                f"x265 {'✅' if has_encoder('libx265') else '⚠️'} · "
+                f"SVT-AV1 {'✅' if has_encoder('libsvtav1') else '⚠️'} · "
+                f"AOM-AV1 {'✅' if has_encoder('libaom-av1') else '⚠️'} · "
+                f"libvmaf {'✅' if has_filter('libvmaf') else '⚠️'} · "
+                f"signalstats {'✅' if has_filter('signalstats') else '⚠️'} · "
+                f"nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · "
+                f"deband {'✅' if has_filter('deband') else '⚠️'} · "
+                f"dash muxer {'✅' if has_muxer('dash') else '⚠️'}"
+            )
+
+            st.info("For Streamlit Cloud, add a repo-root file named `packages.txt` containing exactly: `ffmpeg`.")
+
+            st.code(
+                "Recommended requirements.txt:\n"
+                "streamlit>=1.36\n"
+                "pandas>=2.0\n"
+                "numpy>=1.26\n"
+                "streamlit-webrtc>=0.47\n"
+                "av>=12.0\n",
+                language="text",
+            )
