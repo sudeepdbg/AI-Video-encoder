@@ -23,6 +23,13 @@ V4.1 additions:
   - make_hls()/make_dash(): configurable audio bitrate, CODECS/FRAME-RATE
     attributes in the HLS master playlist, and a real DASH packaging path.
 
+V4.2 additions:
+  - File-based QC module (qc_* functions below): container integrity,
+    video/audio spec compliance, black/freeze frame detection, silence/
+    clipping/phase/loudness (EBU R128 / ATSC A/85) checks, surfaced in a
+    new QC tab and as an optional pre-encode gate in the Workflow tab.
+  - components.html() sizing fix in player() so video isn't cropped.
+
 Core architecture preserved from V3.1: the VMAF-targeted binary search
 (`find_crf_for_target_vmaf` / `per_title_ladder_measured`) and the two-pass
 guaranteed-target-size encoder (`encode_two_pass` / `bitrate_from_target_size`)
@@ -2218,6 +2225,459 @@ def csvrow(row: Dict[str, Any]):
 
 
 # ============================================================
+# File-based QC (V4.2)
+# ============================================================
+#
+# Scope (Phase 1, per product decision): container integrity, video/audio
+# spec compliance, black/freeze frame detection, silence/clipping/phase/
+# loudness (EBU R128 / ATSC A/85). Subtitle/CC QC and true macroblocking/
+# banding artifact detection are explicitly OUT of scope here — they need
+# tooling (pycaption for SCC/TTML, a trained artifact model) this module
+# doesn't have, and are flagged as "unverified" rather than silently
+# skipped or falsely asserted.
+#
+# All checks return a flat dict: {"category","check","status","detail"}
+# with status in {"pass","warn","fail"}. run_qc() aggregates these into a
+# single verdict: FAIL if any check failed, else WARNING if any warned,
+# else PASS. This mirrors a real broadcast QC engine's pass/warn/fail
+# semantics without pretending to be one.
+
+QC_SPECS: Dict[str, Dict[str, Any]] = {
+    "🌐 Web / VOD Generic": {
+        "video_codecs": ["h264", "hevc", "vp9", "av1"],
+        "min_width": 640, "min_height": 360,
+        "fps_range": (15.0, 60.0),
+        "audio_codecs": ["aac", "opus", "ac3", "eac3", "mp3"],
+        "sample_rates": [44100, 48000],
+        "channels": [1, 2, 6, 8],
+        "loudness_target_lufs": -16.0,
+        "loudness_tolerance_lu": 2.0,
+        "true_peak_max_dbfs": -1.0,
+        "required_tags": [],
+    },
+    "📡 Broadcast HD (EBU R128)": {
+        "video_codecs": ["h264", "hevc", "mpeg2video"],
+        "min_width": 1280, "min_height": 720,
+        "fps_range": (23.0, 60.0),
+        "audio_codecs": ["aac", "ac3", "eac3", "pcm_s16le", "pcm_s24le"],
+        "sample_rates": [48000],
+        "channels": [2, 6],
+        "loudness_target_lufs": -23.0,
+        "loudness_tolerance_lu": 1.0,
+        "true_peak_max_dbfs": -1.0,
+        "required_tags": ["title"],
+    },
+    "📺 Broadcast (ATSC A/85)": {
+        "video_codecs": ["h264", "mpeg2video"],
+        "min_width": 1280, "min_height": 720,
+        "fps_range": (23.0, 60.0),
+        "audio_codecs": ["ac3", "eac3", "aac"],
+        "sample_rates": [48000],
+        "channels": [2, 6],
+        "loudness_target_lufs": -24.0,
+        "loudness_tolerance_lu": 2.0,
+        "true_peak_max_dbfs": -2.0,
+        "required_tags": [],
+    },
+    "🎬 Archive / Mezzanine (loose)": {
+        "video_codecs": ["h264", "hevc", "av1", "vp9", "prores", "mpeg2video", "dnxhd"],
+        "min_width": 320, "min_height": 240,
+        "fps_range": (1.0, 120.0),
+        "audio_codecs": ["aac", "ac3", "eac3", "opus", "pcm_s16le", "pcm_s24le", "mp3", "flac"],
+        "sample_rates": [44100, 48000, 96000],
+        "channels": [1, 2, 6, 8],
+        "loudness_target_lufs": None,
+        "loudness_tolerance_lu": 99.0,
+        "true_peak_max_dbfs": 0.0,
+        "required_tags": [],
+    },
+}
+
+
+def _qc_check(category: str, check: str, status: str, detail: str) -> Dict[str, str]:
+    return {"category": category, "check": check, "status": status, "detail": detail}
+
+
+def qc_container_checks(
+    meta: Dict[str, Any],
+    probe_data: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    checks: List[Dict[str, str]] = []
+    fmt = probe_data.get("format", {}) if probe_data else {}
+
+    if not probe_data or not fmt:
+        checks.append(_qc_check(
+            "Container", "Parseability", "fail",
+            "ffprobe could not parse this file — container may be corrupt, truncated, or an unsupported format.",
+        ))
+        return checks
+
+    checks.append(_qc_check("Container", "Parseability", "pass", "File parsed cleanly by ffprobe."))
+
+    streams = probe_data.get("streams", [])
+    n_video = sum(1 for s in streams if s.get("codec_type") == "video")
+    n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
+    n_subs = sum(1 for s in streams if s.get("codec_type") == "subtitle")
+
+    if n_video == 0:
+        checks.append(_qc_check("Container", "Video track presence", "fail", "No video stream detected."))
+    else:
+        checks.append(_qc_check("Container", "Video track presence", "pass", f"{n_video} video stream(s) present."))
+
+    if n_audio == 0:
+        checks.append(_qc_check("Container", "Audio track presence", "warn", "No audio stream detected."))
+    else:
+        checks.append(_qc_check("Container", "Audio track presence", "pass", f"{n_audio} audio stream(s) present."))
+
+    checks.append(_qc_check(
+        "Container", "Subtitle track count", "pass",
+        f"{n_subs} subtitle stream(s) embedded. (Subtitle/CC structural QC is a separate module — not covered here.)",
+    ))
+
+    fmt_dur = float(fmt.get("duration", 0) or 0)
+    vstream = next((s for s in streams if s.get("codec_type") == "video"), {})
+    try:
+        vstream_dur = float(vstream.get("duration")) if vstream.get("duration") else fmt_dur
+    except (TypeError, ValueError):
+        vstream_dur = fmt_dur
+
+    if fmt_dur > 0 and vstream_dur > 0:
+        drift = abs(fmt_dur - vstream_dur)
+        if drift > 0.5:
+            checks.append(_qc_check(
+                "Container", "Duration consistency", "warn",
+                f"Container duration {fmt_dur:.2f}s vs. video stream duration {vstream_dur:.2f}s (drift {drift:.2f}s).",
+            ))
+        else:
+            checks.append(_qc_check(
+                "Container", "Duration consistency", "pass",
+                f"Container and video stream duration consistent ({fmt_dur:.2f}s).",
+            ))
+    else:
+        checks.append(_qc_check(
+            "Container", "Duration consistency", "warn",
+            "Could not determine a reliable duration from stream metadata.",
+        ))
+
+    return checks
+
+
+def qc_video_spec_checks(meta: Dict[str, Any], spec: Dict[str, Any]) -> List[Dict[str, str]]:
+    checks: List[Dict[str, str]] = []
+    vcodec = (meta.get("vcodec") or "").lower()
+
+    if spec["video_codecs"] and vcodec not in spec["video_codecs"]:
+        checks.append(_qc_check(
+            "Video", "Codec compliance", "fail",
+            f"Codec '{vcodec}' is not in the allowed set {spec['video_codecs']} for this delivery spec.",
+        ))
+    else:
+        checks.append(_qc_check("Video", "Codec compliance", "pass", f"Codec '{vcodec}' allowed."))
+
+    w, h = meta.get("width", 0), meta.get("height", 0)
+    if w < spec["min_width"] or h < spec["min_height"]:
+        checks.append(_qc_check(
+            "Video", "Resolution", "fail",
+            f"{w}x{h} is below the minimum {spec['min_width']}x{spec['min_height']} required by this spec.",
+        ))
+    else:
+        checks.append(_qc_check("Video", "Resolution", "pass", f"{w}x{h} meets the minimum resolution."))
+
+    fps = meta.get("fps", 0)
+    lo, hi = spec["fps_range"]
+    if not (lo <= fps <= hi):
+        checks.append(_qc_check(
+            "Video", "Frame rate", "warn",
+            f"{fps:.2f} fps is outside the expected range {lo:g}-{hi:g} fps for this spec.",
+        ))
+    else:
+        checks.append(_qc_check("Video", "Frame rate", "pass", f"{fps:.2f} fps within expected range."))
+
+    if w and h:
+        ar = w / h
+        common = [16 / 9, 4 / 3, 9 / 16, 1.0, 21 / 9]
+        if not any(abs(ar - c) < 0.03 for c in common):
+            checks.append(_qc_check(
+                "Video", "Aspect ratio", "warn",
+                f"Aspect ratio {ar:.3f} doesn't match a common preset (16:9, 4:3, 9:16, 1:1, 21:9) — verify this is intentional.",
+            ))
+        else:
+            checks.append(_qc_check("Video", "Aspect ratio", "pass", f"Aspect ratio {ar:.3f} matches a standard preset."))
+
+    return checks
+
+
+def qc_audio_spec_checks(meta: Dict[str, Any], spec: Dict[str, Any]) -> List[Dict[str, str]]:
+    checks: List[Dict[str, str]] = []
+
+    if not meta.get("has_audio"):
+        return checks  # already flagged at the container level
+
+    acodec = (meta.get("acodec") or "").lower()
+    if spec["audio_codecs"] and acodec not in spec["audio_codecs"]:
+        checks.append(_qc_check(
+            "Audio", "Codec compliance", "fail",
+            f"Codec '{acodec}' is not in the allowed set {spec['audio_codecs']} for this spec.",
+        ))
+    else:
+        checks.append(_qc_check("Audio", "Codec compliance", "pass", f"Codec '{acodec}' allowed."))
+
+    sr = meta.get("sample_rate", 0)
+    if spec["sample_rates"] and sr not in spec["sample_rates"]:
+        checks.append(_qc_check(
+            "Audio", "Sample rate", "warn", f"{sr} Hz is not in the expected set {spec['sample_rates']}.",
+        ))
+    else:
+        checks.append(_qc_check("Audio", "Sample rate", "pass", f"{sr} Hz OK."))
+
+    ch = meta.get("channels", 0)
+    if spec["channels"] and ch not in spec["channels"]:
+        checks.append(_qc_check(
+            "Audio", "Channel configuration", "warn",
+            f"{ch} channel(s) not in the expected set {spec['channels']}.",
+        ))
+    else:
+        checks.append(_qc_check("Audio", "Channel configuration", "pass", f"{ch} channel(s) OK."))
+
+    return checks
+
+
+def qc_metadata_checks(probe_data: Dict[str, Any], spec: Dict[str, Any]) -> List[Dict[str, str]]:
+    checks: List[Dict[str, str]] = []
+    fmt = probe_data.get("format", {}) if probe_data else {}
+    tags = {str(k).lower(): v for k, v in (fmt.get("tags") or {}).items()}
+
+    for req in spec.get("required_tags", []):
+        val = tags.get(req.lower())
+        if not val or not str(val).strip():
+            checks.append(_qc_check("Metadata", f"Tag '{req}'", "warn", f"Required tag '{req}' is missing or empty."))
+        else:
+            checks.append(_qc_check("Metadata", f"Tag '{req}'", "pass", f"'{req}' = {val}"))
+
+    return checks
+
+
+def qc_run_filters(
+    path: Path,
+    meta: Dict[str, Any],
+    spec: Dict[str, Any],
+    sid: str,
+    sample_seconds: Optional[float] = None,
+) -> List[Dict[str, str]]:
+    """
+    Single decode pass running blackdetect + freezedetect on video and
+    silencedetect + astats + ebur128 + aphasemeter on audio. All five
+    filters are non-destructive pass-throughs, so they're chained into one
+    decode instead of five separate passes over the file.
+
+    sample_seconds caps analysis to the first N seconds (quick mode on long
+    files); None analyzes the full duration.
+    """
+    checks: List[Dict[str, str]] = []
+    info = ffinfo()
+
+    if not info["ffmpeg"]:
+        checks.append(_qc_check("System", "FFmpeg availability", "fail", "FFmpeg is not available — cannot run filter-based QC."))
+        return checks
+
+    log = LOG_DIR / f"{sid}_qc.log"
+    duration = meta.get("duration", 0) or 0
+    has_audio = bool(meta.get("has_audio"))
+
+    cmd = [info["ffmpeg"], "-hide_banner", "-nostats", "-y", "-i", str(path)]
+    if sample_seconds and sample_seconds > 0:
+        cmd += ["-t", str(sample_seconds)]
+
+    cmd += ["-vf", "blackdetect=d=0.5:pic_th=0.98,freezedetect=n=-60dB:d=2"]
+
+    if has_audio:
+        af = (
+            "silencedetect=noise=-30dB:d=0.5,"
+            "astats=metadata=0:reset=0,"
+            "ebur128=peak=true,"
+            "aphasemeter=video=0,"
+            "ametadata=print:key=lavfi.aphasemeter.phase"
+        )
+        cmd += ["-af", af]
+    else:
+        cmd += ["-an"]
+
+    cmd += ["-f", "null", os.devnull]
+
+    out = run_ffmpeg(cmd, log, timeout=1800)
+
+    # ---- Black frames ----
+    black_hits = re.findall(
+        r"black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)\s+black_duration:\s*([\d.]+)", out,
+    )
+    if black_hits:
+        total_black = sum(float(d) for _, _, d in black_hits)
+        worst = max(black_hits, key=lambda x: float(x[2]))
+        status = "fail" if total_black > max(2.0, duration * 0.02) else "warn"
+        checks.append(_qc_check(
+            "Video", "Black frames", status,
+            f"{len(black_hits)} black segment(s), {total_black:.2f}s total. Longest: {worst[0]}s-{worst[1]}s ({worst[2]}s).",
+        ))
+    else:
+        checks.append(_qc_check("Video", "Black frames", "pass", "No unexpected black segments detected."))
+
+    # ---- Frozen frames ----
+    freeze_starts = re.findall(r"freeze_start:\s*([\d.]+)", out)
+    freeze_durs = [float(d) for d in re.findall(r"freeze_duration:\s*([\d.]+)", out)]
+    if freeze_starts:
+        total_freeze = sum(freeze_durs)
+        status = "fail" if total_freeze > max(2.0, duration * 0.02) else "warn"
+        starts_preview = ", ".join(freeze_starts[:5]) + ("…" if len(freeze_starts) > 5 else "")
+        checks.append(_qc_check(
+            "Video", "Frozen frames", status,
+            f"{len(freeze_starts)} freeze segment(s), {total_freeze:.2f}s total. Start(s): {starts_preview}.",
+        ))
+    else:
+        checks.append(_qc_check("Video", "Frozen frames", "pass", "No frozen/stuck frames detected."))
+
+    checks.append(_qc_check(
+        "Video", "Macroblocking / artifacts", "warn",
+        "Not reliably detectable with stock FFmpeg filters — this needs a dedicated artifact-detection model "
+        "(e.g. Interra Baton, Tektronix). Treat as unverified, not gated.",
+    ))
+    checks.append(_qc_check(
+        "Video", "Color banding", "warn",
+        "Not reliably detectable with stock FFmpeg filters — treat as unverified. Consider the app's Perceptual "
+        "Debanding toggle proactively on gradient-heavy sources.",
+    ))
+
+    if has_audio:
+        # ---- Silence ----
+        sil_starts = re.findall(r"silence_start:\s*([\d.]+)", out)
+        sil_durs = [float(d) for d in re.findall(r"silence_duration:\s*([\d.]+)", out)]
+        if sil_starts:
+            total_sil = sum(sil_durs)
+            status = "fail" if total_sil > max(3.0, duration * 0.05) else "warn"
+            checks.append(_qc_check(
+                "Audio", "Silence", status, f"{len(sil_starts)} silence segment(s), {total_sil:.2f}s total.",
+            ))
+        else:
+            checks.append(_qc_check("Audio", "Silence", "pass", "No unexpected silence detected."))
+
+        # ---- Clipping (astats "Overall" block) ----
+        overall_block = out.split("Overall")[-1] if "Overall" in out else out
+        clip_matches = re.findall(r"Number of clipped samples:\s*(\d+)", overall_block)
+        peak_matches = re.findall(r"Peak level dB:\s*(-?inf|-?[\d.]+)", overall_block)
+        clipped = int(clip_matches[0]) if clip_matches else 0
+        peak_db = peak_matches[0] if peak_matches else None
+
+        if clipped > 0:
+            status = "fail" if clipped > 100 else "warn"
+            detail = f"{clipped} clipped sample(s) detected." + (f" Peak level: {peak_db} dB." if peak_db else "")
+            checks.append(_qc_check("Audio", "Clipping/distortion", status, detail))
+        else:
+            detail = "No clipped samples detected." + (f" Peak level: {peak_db} dB." if peak_db else "")
+            checks.append(_qc_check("Audio", "Clipping/distortion", "pass", detail))
+
+        # ---- Phase correlation ----
+        phase_vals = [float(v) for v in re.findall(r"lavfi\.aphasemeter\.phase=([\-0-9.]+)", out)]
+        if phase_vals:
+            avg_phase = sum(phase_vals) / len(phase_vals)
+            min_phase = min(phase_vals)
+            if avg_phase < -0.5 or min_phase < -0.9:
+                checks.append(_qc_check(
+                    "Audio", "Phase correlation", "fail",
+                    f"Average correlation {avg_phase:.2f}, minimum {min_phase:.2f} — likely out-of-phase / mono-cancellation risk.",
+                ))
+            elif avg_phase < 0.2:
+                checks.append(_qc_check(
+                    "Audio", "Phase correlation", "warn",
+                    f"Average correlation {avg_phase:.2f} — borderline mono compatibility.",
+                ))
+            else:
+                checks.append(_qc_check(
+                    "Audio", "Phase correlation", "pass", f"Average correlation {avg_phase:.2f} — good mono compatibility.",
+                ))
+        else:
+            checks.append(_qc_check(
+                "Audio", "Phase correlation", "warn",
+                "Could not compute phase correlation (mono source, or aphasemeter unavailable in this ffmpeg build).",
+            ))
+
+        # ---- Loudness (EBU R128 / ATSC A/85 via ebur128 summary) ----
+        i_match = re.search(r"Integrated loudness:\s*\n\s*I:\s*(-?[\d.]+) LUFS", out)
+        lra_match = re.search(r"Loudness range:\s*\n\s*LRA:\s*([\d.]+) LU", out)
+        peak_match = re.search(r"True peak:\s*\n\s*Peak:\s*(-?[\d.]+) dBFS", out)
+
+        integrated = float(i_match.group(1)) if i_match else None
+        lra = float(lra_match.group(1)) if lra_match else None
+        true_peak = float(peak_match.group(1)) if peak_match else None
+
+        target = spec.get("loudness_target_lufs")
+        tol = spec.get("loudness_tolerance_lu", 2.0)
+        tp_max = spec.get("true_peak_max_dbfs", -1.0)
+
+        if integrated is None:
+            checks.append(_qc_check(
+                "Audio", "Loudness (Integrated)", "warn",
+                "Could not measure integrated loudness (libebur128 unavailable, or audio too short to converge).",
+            ))
+        elif target is None:
+            checks.append(_qc_check(
+                "Audio", "Loudness (Integrated)", "pass", f"Measured {integrated:.1f} LUFS (no target enforced for this spec).",
+            ))
+        else:
+            drift = abs(integrated - target)
+            status = "pass" if drift <= tol else ("warn" if drift <= tol * 2 else "fail")
+            checks.append(_qc_check(
+                "Audio", "Loudness (Integrated)", status,
+                f"Measured {integrated:.1f} LUFS vs. target {target:.1f} LUFS ±{tol:.1f} LU (drift {drift:.1f} LU).",
+            ))
+
+        if true_peak is not None:
+            status = "pass" if true_peak <= tp_max else "fail"
+            checks.append(_qc_check("Audio", "True peak", status, f"Measured {true_peak:.1f} dBFS vs. max {tp_max:.1f} dBFS."))
+
+        if lra is not None:
+            checks.append(_qc_check("Audio", "Loudness range", "pass", f"LRA {lra:.1f} LU (informational, not gated)."))
+
+    return checks
+
+
+def run_qc(
+    path: Path,
+    meta: Dict[str, Any],
+    spec_name: str,
+    sid: str,
+    run_filters: bool = True,
+    sample_seconds: Optional[float] = None,
+) -> Dict[str, Any]:
+    spec = QC_SPECS[spec_name]
+    probe_data = probe(path)
+
+    checks: List[Dict[str, str]] = []
+    checks += qc_container_checks(meta, probe_data)
+    checks += qc_video_spec_checks(meta, spec)
+    checks += qc_audio_spec_checks(meta, spec)
+    checks += qc_metadata_checks(probe_data, spec)
+
+    if run_filters:
+        checks += qc_run_filters(path, meta, spec, sid, sample_seconds)
+
+    n_fail = sum(1 for c in checks if c["status"] == "fail")
+    n_warn = sum(1 for c in checks if c["status"] == "warn")
+    n_pass = sum(1 for c in checks if c["status"] == "pass")
+
+    verdict = "FAIL" if n_fail else ("WARNING" if n_warn else "PASS")
+
+    return {
+        "file": path.name,
+        "spec": spec_name,
+        "checks": checks,
+        "verdict": verdict,
+        "n_fail": n_fail,
+        "n_warn": n_warn,
+        "n_pass": n_pass,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+# ============================================================
 # Render helpers
 # ============================================================
 
@@ -2319,6 +2779,8 @@ for k in [
     "upload_src_id",
     "upload_img_id",
     "_last_preset_import",
+    "qc_last_report",
+    "qc_last_file",
 ]:
     if k not in st.session_state:
         st.session_state[k] = None
@@ -2335,7 +2797,7 @@ st.markdown(
     f"""
 <div class='hero'>
   <h1>🎬 VideoForge Studio <span style='font-size:1.1rem;font-weight:700;color:#059669'>V4.0 Enterprise</span></h1>
-  <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep with VMAF knee detection, ABR packaging, and batch processing.</p>
+  <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep with VMAF knee detection, ABR packaging, batch processing, and file-based QC.</p>
   <div style='margin-top:12px'>
     <span class='badge'>{'✅' if info['ffmpeg'] else '❌'} FFmpeg</span>
     <span class='badge'>{'✅' if has_encoder('libx264') else '⚠️'} H.264</span>
@@ -2344,6 +2806,7 @@ st.markdown(
     <span class='badge'>{'✅' if has_filter('libvmaf') else '⚠️'} VMAF</span>
     <span class='badge'>{'✅' if has_filter('signalstats') else '⚠️'} Per-title analysis</span>
     <span class='badge'>{'✅' if has_muxer('dash') else '⚠️'} DASH</span>
+    <span class='badge'>{'✅' if has_filter('ebur128') else '⚠️'} EBU R128 loudness</span>
     <span class='badge badge-enterprise'>🧠 10-bit + psycho-visual RC</span>
   </div>
 </div>
@@ -2360,8 +2823,8 @@ if not info["ffmpeg"]:
 # Tabs
 # ============================================================
 
-tab_work, tab_batch, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_logs = st.tabs(
-    ["🛠️ Workflow", "📦 Batch", "🆚 Compare", "▶️ Player", "📊 Quality", "📈 CRF Sweep", "📡 ABR", "🪵 Logs"]
+tab_work, tab_batch, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_qc, tab_logs = st.tabs(
+    ["🛠️ Workflow", "📦 Batch", "🆚 Compare", "▶️ Player", "📊 Quality", "📈 CRF Sweep", "📡 ABR", "✅ QC", "🪵 Logs"]
 )
 
 
@@ -2396,6 +2859,7 @@ with tab_work:
                 "wf_safety_margin", "wf_denoise", "wf_deblock", "wf_sharpen", "wf_color", "wf_hdr_sdr",
                 "wf_interp", "wf_scale_to", "wf_content_tune", "wf_cap_peak", "wf_grain", "wf_deband",
                 "wf_strict_vbv", "wf_image_mode", "wf_logo_pos", "wf_logo_scale",
+                "wf_qc_gate", "wf_qc_gate_spec", "wf_qc_override",
             ]
             export_dict = {k: st.session_state[k] for k in _preset_keys if k in st.session_state}
             st.download_button(
@@ -2715,6 +3179,32 @@ with tab_work:
                 logo_pos = lc1.selectbox("Logo position", ["Top right", "Top left", "Bottom right", "Bottom left"], key="wf_logo_pos")
                 logo_scale = lc2.slider("Logo scale %", 5, 35, 14, key="wf_logo_scale")
 
+        with st.expander("✅ Pre-encode QC gate", expanded=False):
+            st.caption(
+                "Runs the same container/video/audio QC probes as the QC tab against the source before "
+                "encoding starts. Uses a 60s quick scan (not the full file) to keep the gate fast."
+            )
+            qgc1, qgc2 = st.columns(2)
+            qc_gate_enabled = qgc1.checkbox(
+                "🛡️ Require QC pass before encoding",
+                value=False,
+                key="wf_qc_gate",
+                help="If enabled, blocks the Encode button's run on a FAIL verdict unless the override below is checked.",
+            )
+            qc_gate_spec = qgc2.selectbox(
+                "Gate spec",
+                list(QC_SPECS.keys()),
+                index=0,
+                key="wf_qc_gate_spec",
+                disabled=not qc_gate_enabled,
+            )
+            qc_gate_override = st.checkbox(
+                "Override and encode anyway if QC fails",
+                value=False,
+                key="wf_qc_override",
+                disabled=not qc_gate_enabled,
+            )
+
     enhancements = dict(
         denoise=denoise,
         sharpen=sharpen,
@@ -2799,137 +3289,173 @@ with tab_work:
             if not st.session_state.src:
                 st.error("Upload a source video first.")
             else:
-                sid = uuid.uuid4().hex
-                src = Path(st.session_state.src)
-                logo = Path(st.session_state.img) if st.session_state.img else None
-                bar = st.progress(0.0, text="Starting FFmpeg encode…")
+                src_for_encode = Path(st.session_state.src)
+                proceed_with_encode = True
 
-                if is_target_mode:
-                    opts = dict(
-                        codec=codec,
-                        preset=preset,
-                        target_mb=target_mb,
-                        audio_kbps=target_audio_kbps,
-                        safety_margin_pct=safety_margin_pct,
-                        denoise=denoise,
-                        sharpen=sharpen,
-                        deblock=deblock,
-                        color=color,
-                        hdr_sdr=hdr_sdr,
-                        interp=interp,
-                        scale_to=scale_to,
-                        grain_removal=grain_removal,
-                        deband=deband,
-                        strict_vbv=strict_vbv,
-                    )
+                # ---- Pre-encode QC gate (V4.2) ----
+                if qc_gate_enabled:
+                    gate_sid = uuid.uuid4().hex
+                    with st.spinner("Running pre-encode QC gate…"):
+                        gate_report = run_qc(
+                            src_for_encode, src_meta, qc_gate_spec, gate_sid,
+                            run_filters=True, sample_seconds=60.0,
+                        )
 
-                    out_path, log, md = encode_two_pass(
-                        src,
-                        opts,
-                        src_meta,
-                        sid,
-                        cb=lambda p, t: bar.progress(float(p), text=t),
-                    )
+                    if gate_report["verdict"] == "FAIL":
+                        st.error(
+                            f"❌ Pre-encode QC gate FAILED — {gate_report['n_fail']} failing check(s) "
+                            f"against spec '{qc_gate_spec}'."
+                        )
+                        fail_df = pd.DataFrame([c for c in gate_report["checks"] if c["status"] == "fail"])
+                        if not fail_df.empty:
+                            st.dataframe(
+                                fail_df[["category", "check", "detail"]].rename(
+                                    columns={"category": "Category", "check": "Check", "detail": "Detail"}
+                                ),
+                                use_container_width=True, hide_index=True,
+                            )
+                        if qc_gate_override:
+                            st.warning("Override is enabled — proceeding with encode despite the QC failure.")
+                        else:
+                            proceed_with_encode = False
+                            st.info("Encode blocked. Check 'Override and encode anyway' above to bypass, or fix the source and re-run.")
+                    elif gate_report["verdict"] == "WARNING":
+                        st.warning(f"⚠️ Pre-encode QC gate passed with {gate_report['n_warn']} warning(s) — proceeding with encode.")
+                    else:
+                        st.success("✅ Pre-encode QC gate passed.")
 
-                else:
-                    opts = dict(
-                        codec=codec,
-                        crf=crf,
-                        preset=preset,
-                        profile=profile_name,
-                        denoise=denoise,
-                        sharpen=sharpen,
-                        deblock=deblock,
-                        color=color,
-                        hdr_sdr=hdr_sdr,
-                        interp=interp,
-                        scale_to=scale_to,
-                        image_mode=image_mode,
-                        logo_pos=logo_pos,
-                        logo_scale=logo_scale,
-                        content_tune=content_tune,
-                        cap_peak_bitrate=cap_peak_bitrate,
-                        grain_removal=grain_removal,
-                        deband=deband,
-                        strict_vbv=strict_vbv,
-                    )
-
-                    out_path, log, md = encode_video(
-                        src,
-                        logo,
-                        opts,
-                        src_meta,
-                        sid,
-                        cb=lambda p, t: bar.progress(float(p), text=t),
-                    )
-
-                if not out_path:
-                    st.error(md.get("error", "Encoding failed"))
-                    if md.get("tail"):
-                        st.code(md["tail"])
-                else:
-                    st.session_state.out = str(out_path)
-                    st.session_state.last_md = md
-                    st.session_state.last_log = str(log)
-
-                    if md.get("warning"):
-                        st.warning(md["warning"])
+                if proceed_with_encode:
+                    sid = uuid.uuid4().hex
+                    src = src_for_encode
+                    logo = Path(st.session_state.img) if st.session_state.img else None
+                    bar = st.progress(0.0, text="Starting FFmpeg encode…")
 
                     if is_target_mode:
-                        actual_mb = out_path.stat().st_size / 1048576
-                        if actual_mb > target_mb:
-                            st.warning(
-                                f"⚠️ Output landed at {actual_mb:.2f} MB, over the {target_mb:.1f} MB target "
-                                f"despite the safety margin. Try raising the safety margin or lowering the "
-                                f"target further."
-                            )
+                        opts = dict(
+                            codec=codec,
+                            preset=preset,
+                            target_mb=target_mb,
+                            audio_kbps=target_audio_kbps,
+                            safety_margin_pct=safety_margin_pct,
+                            denoise=denoise,
+                            sharpen=sharpen,
+                            deblock=deblock,
+                            color=color,
+                            hdr_sdr=hdr_sdr,
+                            interp=interp,
+                            scale_to=scale_to,
+                            grain_removal=grain_removal,
+                            deband=deband,
+                            strict_vbv=strict_vbv,
+                        )
 
-                    with st.spinner("Computing quality metrics…"):
-                        q = quality_metrics(src, out_path, sid, quick=True)
+                        out_path, log, md = encode_two_pass(
+                            src,
+                            opts,
+                            src_meta,
+                            sid,
+                            cb=lambda p, t: bar.progress(float(p), text=t),
+                        )
 
-                    st.session_state.last_metrics = q
+                    else:
+                        opts = dict(
+                            codec=codec,
+                            crf=crf,
+                            preset=preset,
+                            profile=profile_name,
+                            denoise=denoise,
+                            sharpen=sharpen,
+                            deblock=deblock,
+                            color=color,
+                            hdr_sdr=hdr_sdr,
+                            interp=interp,
+                            scale_to=scale_to,
+                            image_mode=image_mode,
+                            logo_pos=logo_pos,
+                            logo_scale=logo_scale,
+                            content_tune=content_tune,
+                            cap_peak_bitrate=cap_peak_bitrate,
+                            grain_removal=grain_removal,
+                            deband=deband,
+                            strict_vbv=strict_vbv,
+                        )
 
-                    sm = src_meta
-                    dm = media(out_path)
-                    saved = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
+                        out_path, log, md = encode_video(
+                            src,
+                            logo,
+                            opts,
+                            src_meta,
+                            sid,
+                            cb=lambda p, t: bar.progress(float(p), text=t),
+                        )
 
-                    row = {
-                        "timestamp": datetime.now().isoformat(timespec="seconds"),
-                        "source": src.name,
-                        "output": out_path.name,
-                        "mode": "Two-pass Target Size" if is_target_mode else "Standard CRF",
-                        "profile": profile_name,
-                        "codec": codec,
-                        "actual_encoder": md.get("actual_encoder", ""),
-                        "crf": crf if crf is not None else "",
-                        "preset": preset,
-                        "target_mb": target_mb if is_target_mode else "",
-                        "source_mb": round(sm["size_mb"], 3),
-                        "output_mb": round(dm["size_mb"], 3),
-                        "saved_pct": round(saved, 2),
-                        "grain_removal": grain_removal,
-                        "deband": deband,
-                        "strict_vbv": strict_vbv,
-                        "PSNR": q.get("PSNR"),
-                        "SSIM": q.get("SSIM"),
-                        "VMAF": q.get("VMAF"),
-                        "VMAF_proxy": q.get("VMAF_proxy"),
-                        "log": str(log),
-                    }
+                    if not out_path:
+                        st.error(md.get("error", "Encoding failed"))
+                        if md.get("tail"):
+                            st.code(md["tail"])
+                    else:
+                        st.session_state.out = str(out_path)
+                        st.session_state.last_md = md
+                        st.session_state.last_log = str(log)
 
-                    csvrow(row)
+                        if md.get("warning"):
+                            st.warning(md["warning"])
 
-                    toast(f"Encode complete · {dm['size_mb']:.2f} MB")
-                    st.success(
-                        f"Done · {dm['size_mb']:.2f} MB · saved {saved:.1f}% · encoder {md.get('actual_encoder', 'unknown')}"
-                    )
+                        if is_target_mode:
+                            actual_mb = out_path.stat().st_size / 1048576
+                            if actual_mb > target_mb:
+                                st.warning(
+                                    f"⚠️ Output landed at {actual_mb:.2f} MB, over the {target_mb:.1f} MB target "
+                                    f"despite the safety margin. Try raising the safety margin or lowering the "
+                                    f"target further."
+                                )
 
-                    st.download_button(
-                        "⬇ Download Output",
-                        out_path.read_bytes(),
-                        out_path.name,
-                        md.get("mime", "application/octet-stream"),
-                    )
+                        with st.spinner("Computing quality metrics…"):
+                            q = quality_metrics(src, out_path, sid, quick=True)
+
+                        st.session_state.last_metrics = q
+
+                        sm = src_meta
+                        dm = media(out_path)
+                        saved = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
+
+                        row = {
+                            "timestamp": datetime.now().isoformat(timespec="seconds"),
+                            "source": src.name,
+                            "output": out_path.name,
+                            "mode": "Two-pass Target Size" if is_target_mode else "Standard CRF",
+                            "profile": profile_name,
+                            "codec": codec,
+                            "actual_encoder": md.get("actual_encoder", ""),
+                            "crf": crf if crf is not None else "",
+                            "preset": preset,
+                            "target_mb": target_mb if is_target_mode else "",
+                            "source_mb": round(sm["size_mb"], 3),
+                            "output_mb": round(dm["size_mb"], 3),
+                            "saved_pct": round(saved, 2),
+                            "grain_removal": grain_removal,
+                            "deband": deband,
+                            "strict_vbv": strict_vbv,
+                            "PSNR": q.get("PSNR"),
+                            "SSIM": q.get("SSIM"),
+                            "VMAF": q.get("VMAF"),
+                            "VMAF_proxy": q.get("VMAF_proxy"),
+                            "log": str(log),
+                        }
+
+                        csvrow(row)
+
+                        toast(f"Encode complete · {dm['size_mb']:.2f} MB")
+                        st.success(
+                            f"Done · {dm['size_mb']:.2f} MB · saved {saved:.1f}% · encoder {md.get('actual_encoder', 'unknown')}"
+                        )
+
+                        st.download_button(
+                            "⬇ Download Output",
+                            out_path.read_bytes(),
+                            out_path.name,
+                            md.get("mime", "application/octet-stream"),
+                        )
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -3679,6 +4205,101 @@ with tab_abr:
 
 
 # ============================================================
+# QC tab (V4.2)
+# ============================================================
+
+with tab_qc:
+    st.markdown("<div class='section-title'>File-Based QC</div>", unsafe_allow_html=True)
+    st.caption(
+        "Container integrity, video/audio spec compliance, black/freeze frame detection, silence/clipping/"
+        "phase, and EBU R128 / ATSC A/85 loudness. Macroblocking and banding are surfaced as unverified "
+        "proxies (no reliable open-source detector exists) rather than hard-gated — see each check's detail."
+    )
+
+    qc_src: Optional[Path] = None
+
+    with st.container(border=True):
+        qsrc_choice = st.radio(
+            "Source",
+            ["Use current source", "Use latest output", "Upload new"],
+            horizontal=True,
+            key="qc_src_choice",
+        )
+
+        if qsrc_choice == "Use current source" and st.session_state.src:
+            qc_src = Path(st.session_state.src)
+        elif qsrc_choice == "Use latest output" and st.session_state.out:
+            qc_src = Path(st.session_state.out)
+        elif qsrc_choice == "Upload new":
+            qu = st.file_uploader(
+                "Upload file for QC",
+                type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"],
+                key="qc_upload",
+            )
+            if qu:
+                qc_src = save_upload(qu, IN_DIR)
+
+        if qc_src and qc_src.exists():
+            st.caption(f"Target file: {qc_src.name}")
+        elif qsrc_choice != "Upload new":
+            st.info("No file available for that choice yet — upload or encode something first.")
+
+        qc1, qc2 = st.columns(2)
+        qc_spec_name = qc1.selectbox("Delivery spec", list(QC_SPECS.keys()), index=0, key="qc_spec")
+        qc_scan_depth = qc2.selectbox("Scan depth", ["Quick (first 60s)", "Full file"], index=0, key="qc_scan_depth")
+        qc_sample_seconds = None if qc_scan_depth == "Full file" else 60.0
+
+        if st.button("🔎 Run QC", type="primary", use_container_width=True):
+            if not qc_src or not qc_src.exists():
+                st.error("Select or upload a file first.")
+            else:
+                sid = uuid.uuid4().hex
+                qm = media(qc_src)
+
+                with st.spinner("Running container / video / audio QC probes…"):
+                    report = run_qc(qc_src, qm, qc_spec_name, sid, run_filters=True, sample_seconds=qc_sample_seconds)
+
+                st.session_state["qc_last_report"] = report
+                st.session_state["qc_last_file"] = qc_src.name
+
+    report = st.session_state.get("qc_last_report")
+
+    if report:
+        st.markdown(
+            f"<div class='section-title'>Result — {st.session_state.get('qc_last_file', '')}</div>",
+            unsafe_allow_html=True,
+        )
+
+        verdict = report["verdict"]
+
+        if verdict == "FAIL":
+            st.error(f"❌ FAIL — {report['n_fail']} failing check(s), {report['n_warn']} warning(s), {report['n_pass']} passed.")
+        elif verdict == "WARNING":
+            st.warning(f"⚠️ WARNING — {report['n_warn']} warning(s), {report['n_pass']} passed. No hard failures.")
+        else:
+            st.success(f"✅ PASS — all {report['n_pass']} checks passed.")
+
+        icon_map = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
+        qc_df = pd.DataFrame(report["checks"])
+        qc_df["Status"] = qc_df["status"].map(icon_map)
+
+        st.dataframe(
+            qc_df[["category", "check", "Status", "detail"]].rename(
+                columns={"category": "Category", "check": "Check", "detail": "Detail"}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "⬇ Download QC report (JSON)",
+            json.dumps(report, indent=2).encode(),
+            f"qc_report_{clean(st.session_state.get('qc_last_file', 'file'))}.json",
+            "application/json",
+        )
+
+
+# ============================================================
 # Logs tab
 # ============================================================
 
@@ -3730,6 +4351,7 @@ with tab_logs:
                 f"signalstats {'✅' if has_filter('signalstats') else '⚠️'} · "
                 f"nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · "
                 f"deband {'✅' if has_filter('deband') else '⚠️'} · "
+                f"ebur128 {'✅' if has_filter('ebur128') else '⚠️'} · "
                 f"dash muxer {'✅' if has_muxer('dash') else '⚠️'}"
             )
 
