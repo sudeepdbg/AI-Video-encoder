@@ -3321,6 +3321,15 @@ with tab_work:
                             st.info("Encode blocked. Check 'Override and encode anyway' above to bypass, or fix the source and re-run.")
                     elif gate_report["verdict"] == "WARNING":
                         st.warning(f"⚠️ Pre-encode QC gate passed with {gate_report['n_warn']} warning(s) — proceeding with encode.")
+                        warn_df = pd.DataFrame([c for c in gate_report["checks"] if c["status"] == "warn"])
+                        if not warn_df.empty:
+                            with st.expander(f"⚠️ View {len(warn_df)} warning(s)", expanded=True):
+                                st.dataframe(
+                                    warn_df[["category", "check", "detail"]].rename(
+                                        columns={"category": "Category", "check": "Check", "detail": "Detail"}
+                                    ),
+                                    use_container_width=True, hide_index=True,
+                                )
                     else:
                         st.success("✅ Pre-encode QC gate passed.")
 
