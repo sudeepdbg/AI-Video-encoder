@@ -1,34 +1,43 @@
 """
-VideoForge Studio V4.0 Enterprise
+VideoForge Studio V4.2 Enterprise (Production-Fixed)
 Professional Video Optimization Platform
 
 ⚠️ DEPLOYMENT REMINDER: this app shells out to `ffmpeg` / `ffprobe`.
-   Make sure your repo root has a `packages.txt` containing exactly:
-       ffmpeg
-   (Streamlit Cloud / apt-based hosts only — installs the system binary.)
+Make sure your repo root has a `packages.txt` containing exactly:
+    ffmpeg
+(Streamlit Cloud / apt-based hosts only — installs the system binary.)
 
 V4.0 additions over V3.1:
-  - 10-bit encode pipeline for HEVC/AV1 (yuv420p10le)
-  - Ateme-style psycho-visual rate control (aq-mode, psy-rd, extended B-frames/lookahead)
-  - Visionular-style grain management (NLMeans pre-filter / SVT-AV1 native FGS)
-  - Perceptual debanding filter toggle
-  - Strict VBV/HRD "CDN-safe" streaming toggle
-  - Batch encoding tab
-  - Settings export/import (JSON presets)
-  - VMAF "knee" (diminishing-returns) detection in the CRF Sweep tab
+- 10-bit encode pipeline for HEVC/AV1 (yuv420p10le)
+- Ateme-style psycho-visual rate control (aq-mode, psy-rd, extended B-frames/lookahead)
+- Visionular-style grain management (NLMeans pre-filter / SVT-AV1 native FGS)
+- Perceptual debanding filter toggle
+- Strict VBV/HRD "CDN-safe" streaming toggle
+- Batch encoding tab
+- Settings export/import (JSON presets)
+- VMAF "knee" (diminishing-returns) detection in the CRF Sweep tab
 
 V4.1 additions:
-  - quality_metrics(): optional harmonic-mean temporal pooling for VMAF,
-    and an improved SSIM-based VMAF estimate when libvmaf is unavailable.
-  - make_hls()/make_dash(): configurable audio bitrate, CODECS/FRAME-RATE
-    attributes in the HLS master playlist, and a real DASH packaging path.
+- quality_metrics(): optional harmonic-mean temporal pooling for VMAF,
+  and an improved SSIM-based VMAF estimate when libvmaf is unavailable.
+- make_hls()/make_dash(): configurable audio bitrate, CODECS/FRAME-RATE
+  attributes in the HLS master playlist, and a real DASH packaging path.
 
 V4.2 additions:
-  - File-based QC module (qc_* functions below): container integrity,
-    video/audio spec compliance, black/freeze frame detection, silence/
-    clipping/phase/loudness (EBU R128 / ATSC A/85) checks, surfaced in a
-    new QC tab and as an optional pre-encode gate in the Workflow tab.
-  - components.html() sizing fix in player() so video isn't cropped.
+- File-based QC module (qc_* functions below): container integrity,
+  video/audio spec compliance, black/freeze frame detection, silence/
+  clipping/phase/loudness (EBU R128 / ATSC A/85) checks, surfaced in a
+  new QC tab and as an optional pre-encode gate in the Workflow tab.
+- components.html() sizing fix in player() so video isn't cropped.
+
+V4.2 Production Fixes:
+- [FIX-1] Throttled filesystem cleanup to once/hour (was running on every Streamlit rerun, causing UI freeze).
+- [FIX-2] WORK dir uses env var for cloud runtime safety.
+- [FIX-3] VMAF JSON parsing uses safe fallback chain (prevents TypeError on newer libvmaf).
+- [FIX-4] EBU R128 loudness regex made forgiving for FFmpeg output variations.
+- [FIX-5] Target-size UI shows explicit ERROR when size is too small for audio overhead.
+- [FIX-6] Player inline base64 limit lowered to 10MB to protect server RAM.
+- [FIX-7] Long-running subprocess calls (HLS/DASH/QC) use st.status for live feedback.
 
 Core architecture preserved from V3.1: the VMAF-targeted binary search
 (`find_crf_for_target_vmaf` / `per_title_ladder_measured`) and the two-pass
@@ -62,12 +71,11 @@ try:
 except Exception:
     WEBRTC_AVAILABLE = False
 
-
 # ============================================================
 # Paths + cleanup
 # ============================================================
-
-WORK = Path("work")
+# [FIX-2] Use environment variable for work directory to support cloud runtimes safely
+WORK = Path(os.getenv("VIDEOFORGE_WORK_DIR", "work"))
 IN_DIR = WORK / "inputs"
 OUT_DIR = WORK / "outputs"
 LOG_DIR = WORK / "logs"
@@ -88,19 +96,25 @@ def cleanup_old_files(folder: Path, max_age_hours: int = 12):
             pass
 
 
-cleanup_old_files(IN_DIR, max_age_hours=12)
-cleanup_old_files(OUT_DIR, max_age_hours=12)
-cleanup_old_files(LOG_DIR, max_age_hours=48)
+# [FIX-1] Throttle cleanup to run only once per hour to prevent UI freezing on every interaction.
+# Streamlit reruns the entire script on every button click / slider move / file upload.
+# Running filesystem scans on every rerun caused massive UI lag.
+if "last_cleanup_time" not in st.session_state:
+    st.session_state.last_cleanup_time = 0
+
+if time.time() - st.session_state.last_cleanup_time > 3600:
+    cleanup_old_files(IN_DIR, max_age_hours=12)
+    cleanup_old_files(OUT_DIR, max_age_hours=12)
+    cleanup_old_files(LOG_DIR, max_age_hours=48)
+    st.session_state.last_cleanup_time = time.time()
 
 TARGET_PROFILE = "🎯 Target Size (2-pass)"
-
 
 # ============================================================
 # Page config + light UI
 # ============================================================
-
 st.set_page_config(
-    page_title="VideoForge Studio V4.0",
+    page_title="VideoForge Studio V4.2",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -111,7 +125,6 @@ st.markdown(
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
-
 <style>
 /* ---- base reset & containment ---- */
 html, body, [data-testid="stAppViewContainer"], .stApp {
@@ -120,20 +133,16 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
     color: #0f172a !important;
     overflow-x: hidden !important;
 }
-
 * {
     box-sizing: border-box !important;
 }
-
 [data-testid="stHeader"] {
     background: rgba(247,250,255,.9) !important;
     backdrop-filter: blur(10px);
 }
-
 [data-testid="stSidebar"] {
     display: none !important;
 }
-
 .block-container {
     padding-top: 1.4rem !important;
     padding-bottom: 3rem !important;
@@ -141,20 +150,17 @@ html, body, [data-testid="stAppViewContainer"], .stApp {
     padding-right: 1.5rem !important;
     max-width: 100% !important;
 }
-
 /* ---- headings ---- */
 h1, h2, h3, h4 {
     letter-spacing: -0.02em;
     color: #0f172a;
     font-weight: 800;
 }
-
 /* ---- hide Streamlit cruft ---- */
 #MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"] {
     visibility: hidden !important;
     height: 0 !important;
 }
-
 /* ---- hero ---- */
 .hero {
     background: linear-gradient(135deg, #ffffff 0%, #f0f6ff 100%);
@@ -176,7 +182,6 @@ h1, h2, h3, h4 {
     font-size: 1rem;
     line-height: 1.55;
 }
-
 /* ---- badges ---- */
 .badge {
     display: inline-flex;
@@ -195,7 +200,6 @@ h1, h2, h3, h4 {
     border-color: #a7f3d0;
     color: #065f46;
 }
-
 /* ---- section titles ---- */
 .section-title {
     font-size: .72rem;
@@ -205,7 +209,6 @@ h1, h2, h3, h4 {
     font-weight: 800;
     margin: 28px 0 16px;
 }
-
 /* ---- metric cards ---- */
 .metric-card {
     background: #fff;
@@ -233,7 +236,6 @@ h1, h2, h3, h4 {
     color: #64748b;
     margin-top: 2px;
 }
-
 /* ---- info strips ---- */
 .info-strip {
     background: #dbeafe;
@@ -265,7 +267,6 @@ h1, h2, h3, h4 {
     margin: 10px 0;
     font-size: .9rem;
 }
-
 /* ---- comparison panels ---- */
 .compare-input,
 .compare-output {
@@ -282,7 +283,6 @@ h1, h2, h3, h4 {
     background: linear-gradient(135deg,#dbeafe,#bfdbfe);
     border: 1px solid #93c5fd;
 }
-
 .compare-row {
     display: flex;
     justify-content: space-between;
@@ -301,7 +301,6 @@ h1, h2, h3, h4 {
     color: #0f172a;
     font-weight: 700;
 }
-
 /* ---- savings card ---- */
 .savings-card {
     background: linear-gradient(135deg, #059669, #10b981);
@@ -324,7 +323,6 @@ h1, h2, h3, h4 {
     letter-spacing: .14em;
     margin-top: 6px;
 }
-
 /* ---- buttons ---- */
 .stButton>button {
     border-radius: 12px !important;
@@ -339,7 +337,6 @@ h1, h2, h3, h4 {
     border-radius: 12px !important;
     font-weight: 700 !important;
 }
-
 /* ---- metrics (Streamlit's own) ---- */
 [data-testid="stMetric"] {
     background: #fff;
@@ -353,7 +350,6 @@ h1, h2, h3, h4 {
 [data-testid="stMetricDelta"] {
     color: #0f172a !important;
 }
-
 /* ---- tabs ---- */
 .stTabs [data-baseweb="tab-list"] {
     gap: 8px;
@@ -372,14 +368,12 @@ h1, h2, h3, h4 {
     color: #1d4ed8 !important;
     border-color: #93c5fd !important;
 }
-
 /* ---- video ---- */
 video {
     border-radius: 14px;
     background: #000;
     max-width: 100%;
 }
-
 /* ---- containers with border ---- */
 [data-testid="stVerticalBlockBorderWrapper"] {
     background: #ffffff !important;
@@ -390,7 +384,6 @@ video {
        dataframes, and wide code blocks rendered inside containers.
        Rounded corners come from border-radius alone. */
 }
-
 /* ---- labels ---- */
 label,
 [data-testid="stWidgetLabel"] p,
@@ -399,7 +392,6 @@ label,
     color: #1e293b !important;
     font-weight: 600 !important;
 }
-
 /* ---- inputs ---- */
 .stTextInput input,
 .stNumberInput input,
@@ -424,13 +416,11 @@ li[role="option"]:hover,
 li[aria-selected="true"] {
     background: #eff6ff !important;
 }
-
 /* ---- tooltips ---- */
 [data-baseweb="tooltip"] {
     background: #0f172a !important;
     color: #ffffff !important;
 }
-
 /* ---- EXPANDERS ----
    Deliberately no overflow:hidden on the expander shell — that used to
    clip select dropdowns, dataframes, and st.code blocks living inside an
@@ -452,14 +442,12 @@ li[aria-selected="true"] {
 [data-testid="stExpander"] .stMarkdown {
     max-width: 100% !important;
 }
-
 /* ---- popovers / select menus must always render above everything,
    including inside containers/expanders that establish their own
    stacking context ---- */
 div[data-baseweb="popover"] {
     z-index: 999999 !important;
 }
-
 /* ---- file uploader ---- */
 [data-testid="stFileUploaderDropzone"] {
     background: #f8fafc !important;
@@ -469,7 +457,6 @@ div[data-baseweb="popover"] {
 [data-testid="stFileUploaderDropzone"] * {
     color: #475569 !important;
 }
-
 /* ---- dataframes ---- */
 [data-testid="stDataFrame"],
 [data-testid="stTable"] {
@@ -477,12 +464,10 @@ div[data-baseweb="popover"] {
     border-radius: 12px;
     overflow: auto;
 }
-
 /* ---- alerts ---- */
 [data-testid="stAlert"] {
     border-radius: 12px !important;
 }
-
 /* ---- custom player container (components.html) ---- */
 .video-player-container {
     max-width: 100%;
@@ -493,7 +478,6 @@ div[data-baseweb="popover"] {
     height: auto;
     max-height: 520px;
 }
-
 /* ---- slider label keep on one line ---- */
 [data-testid="stSlider"] label p {
     white-space: nowrap !important;
@@ -503,16 +487,13 @@ div[data-baseweb="popover"] {
     unsafe_allow_html=True,
 )
 
-
 # ============================================================
 # FFmpeg detection
 # ============================================================
-
 @st.cache_resource(show_spinner=False)
 def ffinfo() -> Dict[str, str]:
     ff = shutil.which("ffmpeg")
     fp = shutil.which("ffprobe")
-
     d = {
         "ffmpeg": ff or "",
         "ffprobe": fp or "",
@@ -520,7 +501,6 @@ def ffinfo() -> Dict[str, str]:
         "encoders": "",
         "filters": "",
     }
-
     if ff:
         try:
             d["version"] = subprocess.check_output(
@@ -529,24 +509,20 @@ def ffinfo() -> Dict[str, str]:
                 stderr=subprocess.STDOUT,
                 timeout=5,
             ).splitlines()[0]
-
             d["encoders"] = subprocess.check_output(
                 [ff, "-hide_banner", "-encoders"],
                 text=True,
                 stderr=subprocess.STDOUT,
                 timeout=8,
             )
-
             d["filters"] = subprocess.check_output(
                 [ff, "-hide_banner", "-filters"],
                 text=True,
                 stderr=subprocess.STDOUT,
                 timeout=8,
             )
-
         except Exception as e:
             d["version"] = f"detection error: {e}"
-
     return d
 
 
@@ -580,11 +556,9 @@ def has_muxer(name: str) -> bool:
     except Exception:
         return False
 
-
 # ============================================================
 # File utilities
 # ============================================================
-
 def clean(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(name).stem)[:70] or "video"
 
@@ -592,7 +566,6 @@ def clean(name: str) -> str:
 def save_upload(uploaded, folder: Path) -> Optional[Path]:
     if not uploaded:
         return None
-
     ext = Path(uploaded.name).suffix.lower()
     p = folder / f"{int(time.time())}_{uuid.uuid4().hex[:6]}_{clean(uploaded.name)}{ext}"
     p.write_bytes(uploaded.getbuffer())
@@ -609,7 +582,6 @@ def upload_identity(uploaded) -> Optional[str]:
 def probe_cached(path_str: str, mtime: float, size: int) -> Dict[str, Any]:
     if not ffinfo()["ffprobe"]:
         return {}
-
     try:
         out = subprocess.check_output(
             [
@@ -652,32 +624,26 @@ def infer_bit_depth(stream: Dict[str, Any]) -> int:
             return int(raw)
         except Exception:
             pass
-
     pix = (stream.get("pix_fmt") or "").lower()
-
     if "16" in pix or pix.startswith("p016"):
         return 16
     if "12" in pix:
         return 12
     if "10" in pix or pix.startswith("p010"):
         return 10
-
     return 8
 
 
 def media(p: Path) -> Dict[str, Any]:
     d = probe(p)
     fmt = d.get("format", {}) if d else {}
-
     v, a = {}, {}
     for s in d.get("streams", []):
         if s.get("codec_type") == "video" and not v:
             v = s
         if s.get("codec_type") == "audio" and not a:
             a = s
-
     size = p.stat().st_size if p.exists() else int(fmt.get("size", 0) or 0)
-
     return {
         "duration": float(fmt.get("duration", 0) or 0),
         "size_mb": size / 1048576,
@@ -698,43 +664,33 @@ def media(p: Path) -> Dict[str, Any]:
         "sample_rate": int(a.get("sample_rate", 0) or 0),
     }
 
-
 # ============================================================
 # Source analysis
 # ============================================================
-
 def detect_hdr(meta: Dict[str, Any]) -> bool:
     transfer = (meta.get("color_transfer") or "").lower()
     primaries = (meta.get("color_primaries") or "").lower()
     color_space = (meta.get("color_space") or "").lower()
-
     if any(k in transfer for k in ["smpte2084", "arib-std-b67", "pq", "hlg"]):
         return True
-
     if "bt2020" in primaries and any(k in transfer for k in ["smpte2084", "arib-std-b67"]):
         return True
-
     if "bt2020" in color_space and any(k in transfer for k in ["smpte2084", "arib-std-b67"]):
         return True
-
     return False
 
 
 def recommend_interpolation(meta: Dict[str, Any]) -> Tuple[bool, str]:
     fps = meta.get("fps", 0)
-
     if fps >= 50:
         return False, f"Source is already {fps:.2f} fps. Interpolation is not recommended."
     if fps < 24:
         return True, f"Source is {fps:.2f} fps. Interpolation can improve smoothness."
-
     return True, f"Source is {fps:.2f} fps. Interpolation is optional."
-
 
 # ============================================================
 # Profiles
 # ============================================================
-
 PROFILES = {
     "📦 Smallest File": {
         "desc": "Maximum compression for storage/upload. Higher CRF, smaller file, lower visual fidelity.",
@@ -810,11 +766,9 @@ def map_slider_to_profile(goal: int) -> str:
         return "📱 Social Media"
     return "📦 Smallest File"
 
-
 # ============================================================
 # Filter chain
 # ============================================================
-
 def build_filter_chain(opts: Dict[str, Any], src_meta: Dict[str, Any]) -> str:
     """
     Enterprise note on ordering: grain removal / denoise run first (clean the
@@ -824,34 +778,24 @@ def build_filter_chain(opts: Dict[str, Any], src_meta: Dict[str, Any]) -> str:
     encode so it isn't softened by a later resize), then interpolation last.
     """
     f: List[str] = []
-
     grain_removal = opts.get("grain_removal")
     codec = opts.get("codec", "")
-
     if grain_removal:
-        # SVT-AV1 has native film-grain synthesis (encode clean, re-synthesize
-        # grain on playback via AV1 film-grain metadata) — handled entirely in
-        # codec_args via -svtav1-params film-grain=..., so skip the pre-filter
-        # here to avoid denoising twice.
         uses_svt_fgs = (codec == "AV1" and has_encoder("libsvtav1"))
         if not uses_svt_fgs:
             if has_filter("nlmeans"):
                 f.append("nlmeans=s=3:p=7:r=5")
             else:
                 f.append("hqdn3d=4:3:5:4")
-
     if opts.get("denoise"):
         f.append("hqdn3d=2:2:4:4")
-
     if opts.get("deband"):
         if has_filter("deband"):
             f.append("deband=range=16:1thr=0.02:2thr=0.02:3thr=0.02:4thr=0.02:blur=1")
         elif has_filter("f3kdb"):
             f.append("f3kdb=range=15")
-
     if opts.get("deblock") and has_filter("deblock"):
         f.append("deblock")
-
     if opts.get("hdr_sdr") and detect_hdr(src_meta):
         if has_filter("zscale") and has_filter("tonemap"):
             f.append(
@@ -862,36 +806,27 @@ def build_filter_chain(opts: Dict[str, Any], src_meta: Dict[str, Any]) -> str:
             )
         else:
             f.append("format=yuv420p")
-
     if opts.get("color"):
         f.append("eq=contrast=1.06:saturation=1.10")
-
     scale_to = opts.get("scale_to", "Source")
     if scale_to and scale_to != "Source":
         h = int(scale_to.replace("p", ""))
         f.append(f"scale=-2:{h}:flags=lanczos")
-
     if opts.get("sharpen"):
         f.append("unsharp=5:5:0.4:3:3:0.2")
-
     if opts.get("interp") and src_meta.get("fps", 0) < 50:
         f.append("minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
-
     return ",".join(f)
-
 
 # ============================================================
 # Codec args
 # ============================================================
-
 def _gop_size(src_meta: Dict[str, Any]) -> int:
     """
     ~2s closed GOP aligned to source fps. A fixed, moderate GOP (rather than
     each encoder's own default, which can be 250 frames / ~10s at 25fps)
     keeps files seekable, keeps HLS/ABR segment boundaries clean, and caps
-    how much damage a single bad scene-cut decision can do to a segment —
-    the same reasoning content-adaptive encoders (Netflix per-title, the
-    Visionular Aurora line) apply before any bitrate optimization happens.
+    how much damage a single bad scene-cut decision can do to a segment.
     """
     fps = src_meta.get("fps", 0) or 30
     return max(24, int(round(fps * 2)))
@@ -913,21 +848,11 @@ def codec_args(
     "Animation", "Screen / UGC-graphics", or "Grain-heavy". Mirrors the
     scene-based tuning presets that dedicated CAE encoders (Aurora4/5/1)
     expose, approximated here with the equivalent open x264/x265/SVT-AV1
-    flags — psy-rd and AQ mode change how bits get allocated within a
-    frame, not just how many bits are used.
-
+    flags.
     Enterprise rate-control ("secret sauce") applied unconditionally for
-    x264/x265/SVT-AV1 below: aq-mode=3 (variance-based adaptive
-    quantization), higher psy-rd (protects perceptual detail against
-    RDO's tendency to blur it away), a deeper B-frame/lookahead window
-    (ref=6, bframes=8, b-adapt=2 / b-pyramid=1, rc-lookahead=40,
-    scenecut=40) so the encoder can plan bit allocation over a longer
-    horizon — the same class of technique Ateme/Beamr/Visionular
-    "content-adaptive" modes use, expressed here in stock libx264/
-    libx265/SVT-AV1 flags rather than a proprietary model.
-
-    grain_removal / strict_vbv are optional per-encode toggles wired
-    through from the "Advanced Engine Tuning" UI section.
+    x264/x265/SVT-AV1 below: aq-mode=3, higher psy-rd, deeper B-frame/
+    lookahead window (ref=6, bframes=8, b-adapt=2, rc-lookahead=40,
+    scenecut=40).
     """
     width = src_meta.get("width", 1280)
     mbr_key = "mbr_1080p" if width >= 1500 else "mbr_720p"
@@ -939,21 +864,18 @@ def codec_args(
             "-c:v", enc,
             "-preset", preset,
             "-crf", str(crf),
-            "-pix_fmt", "yuv420p",   # H.264 stays 8-bit for maximum device compatibility
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", profile["audio_aac"],
             "-movflags", "+faststart",
         ]
-
         if enc == "libx264":
             args += ["-g", str(gop), "-keyint_min", str(gop), "-sc_threshold", "40"]
-
             x264_params = [
                 "aq-mode=3", "aq-strength=1.1",
                 "ref=6", "bframes=8", "b-adapt=2",
                 "rc-lookahead=40", "scenecut=40",
             ]
-
             if content_tune == "Animation":
                 args += ["-tune", "animation"]
             elif content_tune == "Screen / UGC-graphics":
@@ -963,7 +885,6 @@ def codec_args(
                 x264_params += ["psy-rd=1.0,0.2"]
             else:
                 x264_params += ["psy-rd=1.0,0.2"]
-
             if strict_vbv and maxrate_kbps:
                 minrate = max(100, int(maxrate_kbps * 0.5))
                 x264_params += ["nal-hrd=cbr"]
@@ -974,25 +895,21 @@ def codec_args(
                 ]
             elif maxrate_kbps:
                 args += ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
-
             args += ["-x264-params", ":".join(x264_params)]
-
         return args, ".mp4", "video/mp4", enc, ""
 
     if codec == "HEVC (H.265)":
         enc = "libx265" if has_encoder("libx265") else "hevc"
         pix_fmt = "yuv420p10le" if enc == "libx265" else "yuv420p"
-
         args = [
             "-c:v", enc,
             "-preset", preset,
             "-crf", str(crf),
-            "-pix_fmt", pix_fmt,   # 10-bit pipeline: eliminates banding, ~15% efficiency gain
+            "-pix_fmt", pix_fmt,
             "-c:a", "aac",
             "-b:a", profile["audio_aac"],
             "-movflags", "+faststart",
         ]
-
         if enc == "libx265":
             x265_params = [
                 "log-level=error",
@@ -1010,10 +927,8 @@ def codec_args(
                 "rc-lookahead=40",
                 "scenecut=40",
             ]
-
             if content_tune == "Grain-heavy":
                 x265_params.append("rd=4")
-
             if strict_vbv and maxrate_kbps:
                 x265_params += [
                     "hrd=1",
@@ -1022,43 +937,32 @@ def codec_args(
                 ]
             elif maxrate_kbps:
                 x265_params += [f"vbv-maxrate={maxrate_kbps}", f"vbv-bufsize={maxrate_kbps * 2}"]
-
             args += ["-tag:v", "hvc1", "-x265-params", ":".join(x265_params)]
-
         return args, ".mp4", "video/mp4", enc, ""
 
     av1_cfg = profile["av1"]
     mbr = av1_cfg.get(mbr_key, 0)
-
     if has_encoder("libsvtav1"):
         svt_params = [f"tune={0 if content_tune == 'Grain-heavy' else 1}"]
-
         if grain_removal:
-            # Native film-grain synthesis: encode a denoised frame, then have
-            # the decoder re-synthesize matching grain from AV1 film-grain
-            # metadata — visually preserves grain "look" at a fraction of the
-            # bitrate cost of actually compressing real noise.
             svt_params += ["film-grain=8", "film-grain-denoise=1"]
         elif content_tune == "Grain-heavy":
             svt_params.append("film-grain=8")
-
         args = [
             "-c:v", "libsvtav1",
             "-crf", str(crf),
             "-preset", str(av1_cfg["preset"]),
             "-g", str(gop),
-            "-pix_fmt", "yuv420p10le",   # 10-bit pipeline for AV1
+            "-pix_fmt", "yuv420p10le",
             "-svtav1-params", ":".join(svt_params),
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
         ]
-
         if strict_vbv and mbr and mbr > 0:
             minrate = max(100, int(mbr * 0.5))
             args += ["-maxrate", f"{mbr}k", "-minrate", f"{minrate}k", "-bufsize", f"{mbr}k"]
         elif mbr and mbr > 0:
             args += ["-maxrate", f"{mbr}k", "-bufsize", f"{mbr * 2}k"]
-
         return args, ".webm", "video/webm", "libsvtav1", ""
 
     if has_encoder("libaom-av1"):
@@ -1073,13 +977,11 @@ def codec_args(
             "-c:a", "libopus",
             "-b:a", profile["audio_opus"],
         ]
-
         if strict_vbv and mbr and mbr > 0:
             minrate = max(100, int(mbr * 0.5))
             args += ["-maxrate", f"{mbr}k", "-minrate", f"{minrate}k", "-bufsize", f"{mbr}k"]
         elif mbr and mbr > 0:
             args += ["-maxrate", f"{mbr}k", "-bufsize", f"{mbr * 2}k"]
-
         return args, ".webm", "video/webm", "libaom-av1", ""
 
     fallback_profile = profile
@@ -1096,59 +998,47 @@ def codec_args(
     )
     return args, ext, mime, actual, "AV1 encoder unavailable. Fell back to H.264."
 
-
 # ============================================================
 # Estimator
 # ============================================================
-
 def estimate_output(src_meta: Dict[str, Any], codec: str, crf: int, enhancements: Dict[str, Any]) -> Dict[str, Any]:
     duration = src_meta.get("duration", 0)
     height = src_meta.get("height", 720)
     src_bitrate = src_meta.get("bitrate_kbps", 0) or 2000
-
     eff = {
         "AV1": 0.45,
         "HEVC (H.265)": 0.60,
         "AVC (H.264)": 0.85,
     }.get(codec, 0.85)
-
     crf_factor = 2 ** ((28 - crf) / 6.0) if crf > 0 else 1.0
     enh_factor = 1.0
-
     if enhancements.get("sharpen"):
         enh_factor *= 1.10
     if enhancements.get("color"):
         enh_factor *= 1.05
     if enhancements.get("grain_removal"):
-        enh_factor *= 0.92   # stripped noise needs fewer bits to represent
+        enh_factor *= 0.92
     if enhancements.get("deband"):
-        enh_factor *= 1.02   # smoothed gradients cost a small amount extra
+        enh_factor *= 1.02
     if enhancements.get("interp") and src_meta.get("fps", 0) < 50:
         enh_factor *= 1.7
     if enhancements.get("scale_to", "Source") != "Source":
         target_h = int(enhancements["scale_to"].replace("p", ""))
         enh_factor *= max(0.4, target_h / max(height, 1))
-
     est_bitrate = max(150, src_bitrate * eff * crf_factor * enh_factor)
     est_size_mb = (est_bitrate * 1000 * duration) / 8 / 1048576 if duration else 0
-
     speed_mult = {
         "AV1": 4.5,
         "HEVC (H.265)": 2.2,
         "AVC (H.264)": 1.0,
     }.get(codec, 1.0)
-
     if enhancements.get("interp") and src_meta.get("fps", 0) < 50:
         speed_mult *= 2.5
-
     if enhancements.get("scale_to", "Source") in ["1080p", "2160p"]:
         speed_mult *= 1.6
-
     if enhancements.get("grain_removal"):
-        speed_mult *= 1.3   # NLMeans pre-filter is not free
-
+        speed_mult *= 1.3
     est_time_sec = duration * speed_mult * 0.5
-
     return {
         "est_bitrate_kbps": int(est_bitrate),
         "est_size_mb": round(est_size_mb, 2),
@@ -1159,11 +1049,9 @@ def estimate_output(src_meta: Dict[str, Any], codec: str, crf: int, enhancements
         ),
     }
 
-
 # ============================================================
 # Target size bitrate
 # ============================================================
-
 def bitrate_from_target_size(
     duration_sec: float,
     target_mb: float,
@@ -1174,29 +1062,21 @@ def bitrate_from_target_size(
     overhead_pct default raised from 2% to 6%: two-pass x264/x265 typically
     lands within ~1-3% of the requested video bitrate, but container
     muxing (moov atom, index) plus that per-pass variance can still push a
-    "just barely under the cap" encode over a hard limit (e.g. Discord's
-    25MB, an email attachment cap). A larger built-in margin trades a
-    little headroom for actually honoring "guaranteed target size".
+    "just barely under the cap" encode over a hard limit.
     """
     if duration_sec <= 0 or target_mb <= 0:
         return 0
-
     total_kbits = target_mb * 8192.0
     total_kbits *= 1 - overhead_pct / 100.0
-
     audio_kbits = audio_kbps * duration_sec
     video_kbits = total_kbits - audio_kbits
-
     if video_kbits <= 0:
         return 0
-
     return max(100, int(video_kbits / duration_sec))
-
 
 # ============================================================
 # FFmpeg runners
 # ============================================================
-
 def _run_encode_pass(
     cmd: List[str],
     duration: float,
@@ -1209,10 +1089,8 @@ def _run_encode_pass(
     lines: List[str] = []
     lo, hi = phase
     log.parent.mkdir(parents=True, exist_ok=True)
-
     with log.open("a", encoding="utf-8") as f:
         f.write("\n\n$ " + " ".join(map(str, cmd)) + "\n")
-
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1225,30 +1103,24 @@ def _run_encode_pass(
         with log.open("a", encoding="utf-8") as f:
             f.write(f"\n[launch error] {e}\n")
         return -1, [f"Failed to launch ffmpeg: {e}"]
-
     last = lo
     start_t = time.time()
-
     assert proc.stderr is not None
-
     try:
         for line in proc.stderr:
             lines.append(line.rstrip())
             with log.open("a", encoding="utf-8") as f:
                 f.write(line)
-
             m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
             if m and cb and duration > 0:
                 sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
                 pct = lo + (hi - lo) * min(max(sec / duration, 0.0), 1.0)
                 pct = max(pct, last)
                 last = pct
-
                 try:
                     cb(pct, f"{label}… {pct * 100:.0f}%")
                 except Exception:
                     pass
-
             if time.time() - start_t > timeout:
                 proc.kill()
                 with log.open("a", encoding="utf-8") as f:
@@ -1257,12 +1129,9 @@ def _run_encode_pass(
     except Exception as e:
         with log.open("a", encoding="utf-8") as f:
             f.write(f"\n[stream read error] {e}\n")
-
     rc = proc.wait()
-
     with log.open("a", encoding="utf-8") as f:
         f.write(f"\n[exit] {rc}\n")
-
     return rc, lines
 
 
@@ -1275,12 +1144,9 @@ def run_ffmpeg(cmd: List[str], log: Path, timeout: int = 900) -> str:
             text=True,
             timeout=timeout,
         )
-
         with log.open("a", encoding="utf-8") as f:
             f.write("\n$ " + " ".join(map(str, cmd)) + "\n" + (p.stdout or ""))
-
         return p.stdout or ""
-
     except subprocess.TimeoutExpired:
         with log.open("a", encoding="utf-8") as f:
             f.write(f"\n[timeout after {timeout}s]\n")
@@ -1290,11 +1156,9 @@ def run_ffmpeg(cmd: List[str], log: Path, timeout: int = 900) -> str:
             f.write(f"\n[error] {e}\n")
         return str(e)
 
-
 # ============================================================
 # Encoding
 # ============================================================
-
 def encode_video(
     src: Path,
     logo: Optional[Path],
@@ -1306,86 +1170,62 @@ def encode_video(
 ) -> Tuple[Optional[Path], Path, Dict[str, Any]]:
     """
     Standard single-pass CRF encode.
-
     trim_seconds: if set, output is capped to this many seconds (used by the
     CRF Sweep tab so users can preview settings on a short clip instead of
-    paying full encode cost per CRF step). Progress percentage is computed
-    against the trimmed duration, not the full source duration, when set.
+    paying full encode cost per CRF step).
     """
     log = LOG_DIR / f"{sid}.log"
     info = ffinfo()
-
     if not info["ffmpeg"]:
         return None, log, {"error": "FFmpeg missing. Ensure packages.txt contains `ffmpeg` and redeploy."}
-
     profile = PROFILES[opts["profile"]]
     codec = opts["codec"]
     crf = int(opts["crf"])
     preset = str(opts["preset"])
-
     maxrate_kbps = None
     if opts.get("cap_peak_bitrate") or opts.get("strict_vbv"):
         est = estimate_output(src_meta, codec, crf, opts)
-        # Strict streaming wants a tight peak/average ratio (CDN/HLS-safe,
-        # ~1.5x is the common Apple HLS recommendation); the looser "cap
-        # peak bitrate" checkbox just wants to stop runaway spikes.
         mult = 1.5 if opts.get("strict_vbv") else 2.2
         maxrate_kbps = max(300, int(est["est_bitrate_kbps"] * mult))
-
     args, ext, mime, actual_encoder, warning = codec_args(
         codec, crf, preset, profile, src_meta,
         opts.get("content_tune", "Auto"), maxrate_kbps,
         grain_removal=opts.get("grain_removal", False),
         strict_vbv=opts.get("strict_vbv", False),
     )
-
     codec_label = actual_encoder.replace("lib", "").replace("-", "")
     out = OUT_DIR / f"{clean(src.name)}_{codec_label}_crf{crf}_{sid[:8]}{ext}"
-
     vf = build_filter_chain(opts, src_meta)
     cmd = [info["ffmpeg"], "-hide_banner", "-y", "-i", str(src)]
-
     if logo and logo.exists() and opts.get("image_mode") == "Watermark / logo overlay":
         cmd += ["-i", str(logo)]
-
         pos = {
             "Top right": "main_w-overlay_w-24:24",
             "Top left": "24:24",
             "Bottom right": "main_w-overlay_w-24:main_h-overlay_h-24",
             "Bottom left": "24:main_h-overlay_h-24",
         }[opts.get("logo_pos", "Top right")]
-
         base = vf + "," if vf else ""
         fc = (
             f"[1:v]scale=iw*{opts.get('logo_scale', 14)}/100:-1[logo];"
             f"[0:v]{base}format=yuv420p[base];"
             f"[base][logo]overlay={pos}:format=auto[v]"
         )
-
         cmd += ["-filter_complex", fc, "-map", "[v]", "-map", "0:a?", "-shortest"]
-
     elif vf:
         cmd += ["-vf", vf]
-
     cmd += args
-
     if trim_seconds and trim_seconds > 0:
         cmd += ["-t", str(trim_seconds)]
-
     cmd += [str(out)]
-
     full_duration = max(src_meta.get("duration", 0.001), 0.001)
     duration = min(trim_seconds, full_duration) if trim_seconds else full_duration
     duration = max(duration, 0.001)
-
     rc, lines = _run_encode_pass(cmd, duration, log, cb, phase=(0.0, 1.0), label="Encoding")
-
     if cb:
         cb(1.0, "Encoding complete")
-
     if rc != 0 or not out.exists():
         return None, log, {"error": "Encoding failed", "tail": "\n".join(lines[-120:])}
-
     return out, log, {
         "mime": mime,
         "actual_encoder": actual_encoder,
@@ -1402,39 +1242,28 @@ def encode_two_pass(
 ) -> Tuple[Optional[Path], Path, Dict[str, Any]]:
     """
     Guaranteed-target-size two-pass encoder. Core bitrate math
-    (`bitrate_from_target_size`) is unchanged from V3.1 — only the encoder
-    flag strings passed to ffmpeg were extended with the same 10-bit /
-    psycho-visual / strict-VBV options used in `codec_args`, kept consistent
-    with the CRF-mode encoder path.
+    (`bitrate_from_target_size`) is unchanged from V3.1.
     """
     log = LOG_DIR / f"{sid}.log"
     info = ffinfo()
-
     if not info["ffmpeg"]:
         return None, log, {"error": "FFmpeg missing. Ensure packages.txt contains `ffmpeg` and redeploy."}
-
     duration = src_meta.get("duration", 0)
-
     if duration <= 0:
         return None, log, {"error": "Could not determine source duration. Target-size mode needs known duration."}
-
     codec = opts.get("codec", "AVC (H.264)")
     preset = opts.get("preset", "medium")
     target_mb = float(opts.get("target_mb", 25))
     audio_kbps = int(opts.get("audio_kbps", 128))
     grain_removal = bool(opts.get("grain_removal", False))
     strict_vbv = bool(opts.get("strict_vbv", False))
-
     safety_margin_pct = float(opts.get("safety_margin_pct", 6.0))
     v_kbps = bitrate_from_target_size(duration, target_mb, audio_kbps, safety_margin_pct)
-
     if v_kbps <= 0:
         return None, log, {
             "error": "Target size is too small for this duration plus audio bitrate. Raise target size or lower audio bitrate."
         }
-
     warning = ""
-
     if codec == "HEVC (H.265)" and has_encoder("libx265"):
         venc, ext, acodec = "libx265", ".mp4", "aac"
     elif codec == "AV1" and has_encoder("libaom-av1"):
@@ -1443,24 +1272,17 @@ def encode_two_pass(
         if codec != "AVC (H.264)":
             warning = f"{codec} target-size encoder unavailable. Fell back to H.264."
         venc, ext, acodec = ("libx264" if has_encoder("libx264") else "h264"), ".mp4", "aac"
-
     mime = "video/webm" if ext == ".webm" else "video/mp4"
     out = OUT_DIR / f"{clean(src.name)}_target{int(target_mb)}mb_{venc}_{sid[:8]}{ext}"
     passlog = str(LOG_DIR / f"{sid}_2pass")
-
     vf = build_filter_chain(opts, src_meta)
-
     base = [info["ffmpeg"], "-hide_banner", "-y", "-i", str(src)]
-
     if vf:
         base += ["-vf", vf]
-
     v_args = ["-c:v", venc, "-b:v", f"{v_kbps}k", "-passlogfile", passlog]
     minrate_kbps = max(100, int(v_kbps * 0.5))
-
     if venc in ("libx264", "libx265"):
         v_args += ["-preset", preset]
-
         if venc == "libx265":
             v_args += ["-pix_fmt", "yuv420p10le"]
             x265_params = [
@@ -1486,67 +1308,46 @@ def encode_two_pass(
             else:
                 v_args += ["-maxrate", f"{int(v_kbps * 1.3)}k", "-bufsize", f"{v_kbps * 2}k"]
             v_args += ["-x264-params", ":".join(x264_params)]
-
     elif venc == "libaom-av1":
         v_args += ["-cpu-used", "6", "-row-mt", "1", "-pix_fmt", "yuv420p10le"]
         if strict_vbv:
             v_args += ["-maxrate", f"{v_kbps}k", "-minrate", f"{minrate_kbps}k", "-bufsize", f"{v_kbps}k"]
         else:
             v_args += ["-maxrate", f"{int(v_kbps * 1.3)}k", "-bufsize", f"{v_kbps * 2}k"]
-
     cmd1 = base + v_args + ["-an", "-pass", "1", "-f", "null", os.devnull]
     rc1, lines1 = _run_encode_pass(
-        cmd1,
-        duration,
-        log,
-        cb,
-        phase=(0.0, 0.45),
-        label="Pass 1/2",
+        cmd1, duration, log, cb, phase=(0.0, 0.45), label="Pass 1/2",
     )
-
     if rc1 != 0:
         return None, log, {
             "error": "Two-pass encode failed on pass 1.",
             "tail": "\n".join(lines1[-120:]),
         }
-
     cmd2 = base + v_args + [
         "-pass", "2",
         "-c:a", acodec,
         "-b:a", f"{audio_kbps}k",
     ]
-
     if venc == "libx265":
         cmd2 += ["-tag:v", "hvc1"]
     if ext == ".mp4":
         cmd2 += ["-movflags", "+faststart"]
-
     cmd2 += [str(out)]
-
     rc2, lines2 = _run_encode_pass(
-        cmd2,
-        duration,
-        log,
-        cb,
-        phase=(0.45, 1.0),
-        label="Pass 2/2",
+        cmd2, duration, log, cb, phase=(0.45, 1.0), label="Pass 2/2",
     )
-
     if cb:
         cb(1.0, "Two-pass encode complete")
-
     for pf in LOG_DIR.glob(f"{sid}_2pass*"):
         try:
             pf.unlink()
         except Exception:
             pass
-
     if rc2 != 0 or not out.exists():
         return None, log, {
             "error": "Two-pass encode failed on pass 2.",
             "tail": "\n".join(lines2[-120:]),
         }
-
     return out, log, {
         "mime": mime,
         "target_video_kbps": v_kbps,
@@ -1554,11 +1355,9 @@ def encode_two_pass(
         "warning": warning,
     }
 
-
 # ============================================================
 # Quality metrics
 # ============================================================
-
 def quality_metrics(
     ref: Path,
     dist: Path,
@@ -1569,51 +1368,20 @@ def quality_metrics(
 ) -> Dict[str, Any]:
     """
     quick=True caps analysis to a sample window (60s by default) for speed.
-    limit_sec, if given, overrides that window length explicitly — e.g. the
-    CRF Sweep tab wires its "sample duration" selector into this so the
-    quality-metric window actually matches what the user picked, and
-    limit_sec=None with quick=False analyzes the full clip.
-
+    limit_sec, if given, overrides that window length explicitly.
     CHANGED (V4.1) — temporal_pooling: when True and libvmaf is available,
-    runs a *second* libvmaf pass with pool=harmonic_mean and stores the
-    result under the new key "VMAF_harmonic". Harmonic-mean pooling
-    penalizes low-scoring frames/segments far more heavily than the
-    default arithmetic mean libvmaf reports as "VMAF" — useful for
-    surfacing brief quality dips (e.g. a hard scene cut or a fast-motion
-    segment) that an arithmetic average smooths over. This is additive:
-    "VMAF" (arithmetic mean) is always still computed and returned the
-    same as before, so existing callers are unaffected.
-
-    CHANGED (V4.1) — when libvmaf is unavailable, the old proxy
-    (100 * SSIM**0.45) has been replaced. It's still just SSIM-derived
-    (no real VMAF machinery without libvmaf), but uses a two-term
-    estimate instead of a single power curve:
-      1. A linear SSIM->VMAF mapping (VMAF ≈ 163.6*SSIM - 64.0), which is
-         a much closer fit to typical libx264/libx265 SSIM/VMAF pairs in
-         the CRF 18-32 / 480p-1080p range than the old power curve (which
-         overstates quality near SSIM≈1 and understates it in the
-         mid-range).
-      2. A small bitrate-per-pixel correction, since real VMAF models
-         (including ITU-T P.1204.3) weigh more than SSIM alone — at equal
-         SSIM, more bits-per-pixel usually means more preserved detail
-         that a true VMAF run would credit and SSIM under-weights.
-    This is still a heuristic, not a validated ITU model — treat it as a
-    rough estimate, and prefer a real ffmpeg build with libvmaf whenever
-    accuracy matters.
+    runs a second libvmaf pass with pool=harmonic_mean.
+    CHANGED (V4.1) — improved SSIM-based VMAF proxy when libvmaf unavailable.
     """
     res: Dict[str, Any] = {}
     info = ffinfo()
-
     if not info["ffmpeg"]:
         return res
-
     log = LOG_DIR / f"{sid}.log"
     mm = media(ref)
     w, h = mm.get("width", 0), mm.get("height", 0)
-
     if not w or not h:
         return res
-
     eff_limit: Optional[float]
     if limit_sec is not None:
         eff_limit = limit_sec
@@ -1621,56 +1389,47 @@ def quality_metrics(
         eff_limit = 60.0
     else:
         eff_limit = None
-
     limit = ["-t", str(eff_limit)] if eff_limit else []
-
     graph = (
         f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[refp][refs];"
         f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[distp][dists];"
         f"[refp][distp]psnr;"
         f"[refs][dists]ssim"
     )
-
     out = run_ffmpeg(
         [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
         + limit
         + ["-lavfi", graph, "-an", "-f", "null", "-"],
-        log,
-        600,
+        log, 600,
     )
-
     m = re.search(r"average:([0-9.]+|inf)", out)
     if m:
         res["PSNR"] = 100.0 if m.group(1) == "inf" else float(m.group(1))
-
     m = re.search(r"All:([0-9.]+)", out)
     if m:
         res["SSIM"] = float(m.group(1))
-
     if has_filter("libvmaf"):
         js = LOG_DIR / f"{sid}_vmaf.json"
-
         graph_v = (
             f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[ref];"
             f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[dist];"
             f"[dist][ref]libvmaf=log_fmt=json:log_path={js}"
         )
-
         run_ffmpeg(
             [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
             + limit
             + ["-lavfi", graph_v, "-an", "-f", "null", "-"],
-            log,
-            900,
+            log, 900,
         )
-
         try:
             data = json.loads(js.read_text())
-            res["VMAF"] = float(data.get("pooled_metrics", {}).get("vmaf", {}).get("mean"))
+            # [FIX-3] Safe fallback chain for VMAF JSON parsing (prevents TypeError on newer libvmaf)
+            vmaf_data = data.get("pooled_metrics", {}).get("vmaf", {})
+            vmaf_score = vmaf_data.get("mean") or vmaf_data.get("harmonic_mean") or vmaf_data.get("average")
+            if vmaf_score is not None:
+                res["VMAF"] = float(vmaf_score)
         except Exception:
             pass
-
-        # CHANGED (V4.1): optional second pass with harmonic-mean pooling.
         if temporal_pooling:
             js_h = LOG_DIR / f"{sid}_vmaf_harmonic.json"
             graph_vh = (
@@ -1678,58 +1437,41 @@ def quality_metrics(
                 f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[dist];"
                 f"[dist][ref]libvmaf=log_fmt=json:log_path={js_h}:pool=harmonic_mean"
             )
-
             run_ffmpeg(
                 [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
                 + limit
                 + ["-lavfi", graph_vh, "-an", "-f", "null", "-"],
-                log,
-                900,
+                log, 900,
             )
-
             try:
                 data_h = json.loads(js_h.read_text())
                 res["VMAF_harmonic"] = float(
                     data_h.get("pooled_metrics", {}).get("vmaf", {}).get("mean")
                 )
             except Exception:
-                # Older libvmaf builds may reject the `pool=` option — fail
-                # silently rather than breaking the rest of the metrics.
                 pass
-
     elif res.get("SSIM"):
-        # CHANGED (V4.1): replaced 100*SSIM**0.45 with a linear SSIM->VMAF
-        # mapping plus a small bitrate-per-pixel correction. See docstring.
         ssim = res["SSIM"]
         dm = media(dist)
-
         bpp = 0.0
         if dm.get("width") and dm.get("height") and dm.get("bitrate_kbps"):
             px = dm["width"] * dm["height"]
-            bpp = (dm["bitrate_kbps"] * 1000) / max(px, 1)  # bits/sec per pixel
-
+            bpp = (dm["bitrate_kbps"] * 1000) / max(px, 1)
         base = max(0.0, min(100.0, 163.6 * ssim - 64.0))
         bpp_adj = max(-4.0, min(4.0, (bpp - 0.05) * 20.0)) if bpp else 0.0
-
         res["VMAF_proxy"] = round(max(0.0, min(100.0, base + bpp_adj)), 2)
-
     return res
-
 
 # ============================================================
 # Per-title ABR analysis
 # ============================================================
-
 def analyze_complexity(src: Path, duration: float, sid: str) -> float:
     info = ffinfo()
     log = LOG_DIR / f"{sid}.log"
-
     if not info["ffmpeg"] or not has_filter("signalstats"):
         return 0.5
-
     sample_t = min(20.0, max(3.0, duration * 0.1)) if duration else 8.0
     start = max(0.0, duration / 2 - sample_t / 2) if duration else 0.0
-
     cmd = [
         info["ffmpeg"],
         "-hide_banner",
@@ -1741,15 +1483,11 @@ def analyze_complexity(src: Path, duration: float, sid: str) -> float:
         "-f", "null",
         os.devnull,
     ]
-
     out = run_ffmpeg(cmd, log, 120)
     vals = [float(m) for m in re.findall(r"lavfi\.signalstats\.YDIF=([0-9.]+)", out)]
-
     if not vals:
         return 0.5
-
     avg_diff = sum(vals) / len(vals)
-
     return round(max(0.0, min(1.0, avg_diff / 20.0)), 3)
 
 
@@ -1767,29 +1505,16 @@ def find_crf_for_target_vmaf(
     max_probes: int = 4,
 ) -> Dict[str, Any]:
     """
-    Measured, VMAF-targeted rate point for one resolution rung — the open-source
-    approximation of what Netflix per-title encoding and content-adaptive
-    encoders (Visionular's Aurora line) do: probe a handful of encode points
-    on a short sample, measure actual perceptual quality, and binary-search
-    to the CRF that lands closest to a target VMAF, instead of assuming a
-    fixed CRF/bitrate works equally well for every title. Only a short
-    sample window is encoded per probe to keep this fast enough to run
-    inline in a Streamlit session.
-
-    UNCHANGED from V3.1 — this is the core "secret sauce" algorithm and its
-    math is preserved exactly.
+    Measured, VMAF-targeted rate point for one resolution rung.
+    UNCHANGED from V3.1 — core "secret sauce" algorithm preserved exactly.
     """
     info = ffinfo()
     lo, hi = crf_lo, crf_hi
     best: Optional[Dict[str, Any]] = None
-
-    sm = {"width": width, "height": height, "fps": 30, "duration": sample_sec}
-
     for _ in range(max_probes):
         crf = (lo + hi) // 2
         sid = uuid.uuid4().hex
         log = LOG_DIR / f"{sid}.log"
-
         vf = f"scale={width}:{height}:flags=lanczos"
         enc = "libx264" if (codec != "HEVC (H.265)" or not has_encoder("libx265")) else "libx265"
         cmd = [
@@ -1803,35 +1528,26 @@ def find_crf_for_target_vmaf(
         ]
         probe_out = LOG_DIR / f"{sid}_probe.mp4"
         cmd.append(str(probe_out))
-
         run_ffmpeg(cmd, log, 300)
-
         if not probe_out.exists():
             break
-
         qm = quality_metrics(src, probe_out, sid, quick=True, limit_sec=sample_sec)
         vmaf = qm.get("VMAF", qm.get("VMAF_proxy"))
-
         try:
             probe_out.unlink()
         except Exception:
             pass
-
         if vmaf is None:
             break
-
         cand = {"crf": crf, "vmaf": vmaf, "size_bytes": 0}
         if best is None or abs(vmaf - target_vmaf) < abs(best["vmaf"] - target_vmaf):
             best = cand
-
         if vmaf > target_vmaf:
-            lo = crf + 1   # too good / too big -> raise CRF (smaller, lower quality)
+            lo = crf + 1
         else:
-            hi = crf - 1   # too low quality -> lower CRF (bigger, higher quality)
-
+            hi = crf - 1
         if lo > hi:
             break
-
     return best or {"crf": (crf_lo + crf_hi) // 2, "vmaf": None}
 
 
@@ -1842,19 +1558,10 @@ def per_title_ladder_measured(
     sample_sec: float = 8.0,
 ) -> List[Dict[str, Any]]:
     """
-    Convex-hull-style ladder: for each candidate rung resolution, measure the
-    CRF that actually hits the target VMAF on a short sample of this specific
-    title, then encode that same sample at the found CRF to read its real
-    bitrate. This replaces the fixed 0.7-1.5x complexity multiplier with an
-    actual rate-distortion measurement per rung, per title — the core idea
-    behind Netflix's per-title encoding and Visionular Aurora's CAE, without
-    requiring their proprietary encoder.
-
-    UNCHANGED from V3.1 — core "secret sauce" logic preserved exactly.
+    Convex-hull-style ladder. UNCHANGED from V3.1.
     """
     duration = src_meta.get("duration", 0) or 0
     start = max(0.0, duration / 2 - sample_sec / 2) if duration else 0.0
-
     rungs = [
         {"w": 426, "h": 240},
         {"w": 854, "h": 480},
@@ -1862,15 +1569,12 @@ def per_title_ladder_measured(
     ]
     if src_meta.get("height", 0) >= 1000 and src_meta.get("width", 0) >= 1700:
         rungs.append({"w": 1920, "h": 1080})
-
     ladder = []
     for r in rungs:
         found = find_crf_for_target_vmaf(
             src, r["w"], r["h"], target_vmaf, sample_sec, start
         )
         crf = found["crf"]
-
-        # Encode the sample once more at the winning CRF to read its bitrate.
         sid = uuid.uuid4().hex
         log = LOG_DIR / f"{sid}.log"
         probe_out = LOG_DIR / f"{sid}_final.mp4"
@@ -1883,7 +1587,6 @@ def per_title_ladder_measured(
             "-pix_fmt", "yuv420p", "-an", str(probe_out),
         ]
         run_ffmpeg(cmd, log, 300)
-
         bitrate_kbps = 800
         if probe_out.exists():
             size_bits = probe_out.stat().st_size * 8
@@ -1892,7 +1595,6 @@ def per_title_ladder_measured(
                 probe_out.unlink()
             except Exception:
                 pass
-
         ladder.append({
             "Resolution": f"{r['w']}x{r['h']}",
             "w": r["w"],
@@ -1901,7 +1603,6 @@ def per_title_ladder_measured(
             "crf_used": crf,
             "measured_vmaf": found.get("vmaf"),
         })
-
     return ladder
 
 
@@ -1911,12 +1612,9 @@ def per_title_ladder(src_meta: Dict[str, Any], complexity: float) -> List[Dict[s
         {"h": 480, "w": 854, "base_kbps": 800},
         {"h": 720, "w": 1280, "base_kbps": 2000},
     ]
-
     if src_meta.get("height", 0) >= 1000 and src_meta.get("width", 0) >= 1700:
         base_rungs.append({"h": 1080, "w": 1920, "base_kbps": 3800})
-
     mult = 0.7 + complexity * 0.8
-
     ladder = []
     for r in base_rungs:
         ladder.append({
@@ -1925,14 +1623,11 @@ def per_title_ladder(src_meta: Dict[str, Any], complexity: float) -> List[Dict[s
             "h": r["h"],
             "bitrate_kbps": int(round(r["base_kbps"] * mult, -1)),
         })
-
     return ladder
-
 
 # ============================================================
 # HLS / DASH packaging
 # ============================================================
-
 DEFAULT_LADDER = [
     {"w": 426, "h": 240, "bitrate_kbps": 400},
     {"w": 854, "h": 480, "bitrate_kbps": 900},
@@ -1942,12 +1637,7 @@ DEFAULT_LADDER = [
 
 def _avc_codec_tag(h: int) -> str:
     """
-    CHANGED (V4.1): coarse resolution -> AVC CODECS-tag mapping used in both
-    the HLS master playlist and (informationally) the DASH path.
-    avc1.640028 = High Profile, Level 4.0 (safe up to ~1080p30).
-    avc1.64001f = High Profile, Level 3.1 (safe for <=720p).
-    This is a resolution heuristic, not a bitstream-derived level — good
-    enough as a player compatibility hint, not a substitute for parsing SPS.
+    CHANGED (V4.1): coarse resolution -> AVC CODECS-tag mapping.
     """
     return "avc1.640028" if h >= 1000 else "avc1.64001f"
 
@@ -1961,39 +1651,25 @@ def make_hls(
     format: str = "hls",
 ) -> Tuple[Path, Path, List[str]]:
     """
-    CHANGED (V4.1):
-      - audio_bitrate (kbps) replaces the old hardcoded 96k, used for both
-        the actual encoded AAC bitrate and the playlist BANDWIDTH math.
-      - source_fps, if given, populates FRAME-RATE in the master playlist;
-        falls back to 30 if not provided.
-      - CODECS="avc1.xxxxxx,mp4a.40.2" added to every #EXT-X-STREAM-INF line
-        (see _avc_codec_tag).
-      - format="dash" now delegates to make_dash() for real MPEG-DASH
-        packaging instead of raising NotImplementedError.
+    CHANGED (V4.1): configurable audio bitrate, CODECS/FRAME-RATE in master.
     """
     if format == "dash":
         return make_dash(src, sid, ladder=ladder, audio_bitrate=audio_bitrate, source_fps=source_fps)
-
     log = LOG_DIR / f"{sid}.log"
     od = OUT_DIR / f"abr_{sid[:8]}"
     od.mkdir(exist_ok=True)
-
     rungs = ladder if ladder else DEFAULT_LADDER
     lines = ["#EXTM3U", "#EXT-X-VERSION:3"]
     errors: List[str] = []
-
     fps_val = source_fps if source_fps and source_fps > 0 else 30.0
     audio_br_k = int(audio_bitrate)
-
     for rung in rungs:
         w, h, br_k = rung["w"], rung["h"], rung["bitrate_kbps"]
         br = f"{br_k}k"
         name = f"{h}p.m3u8"
-
         cmd = [
             ffinfo()["ffmpeg"],
-            "-hide_banner",
-            "-y",
+            "-hide_banner", "-y",
             "-i", str(src),
             "-vf", f"scale=w={w}:h={h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
             "-c:v", "libx264" if has_encoder("libx264") else "h264",
@@ -2009,25 +1685,15 @@ def make_hls(
             "-hls_segment_filename", str(od / f"{h}p_%03d.ts"),
             str(od / name),
         ]
-
         try:
             p = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=1800,
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=1800,
             )
-
             with log.open("a", encoding="utf-8") as f:
                 f.write("\n$ " + " ".join(map(str, cmd)) + "\n" + (p.stdout or ""))
-
             if p.returncode == 0 and (od / name).exists():
-                # Corrected BANDWIDTH: total bitrate = video + audio + small overhead
-                total_br_bps = int((br_k + audio_br_k) * 1000 * 1.1)   # +10% container overhead
-
+                total_br_bps = int((br_k + audio_br_k) * 1000 * 1.1)
                 codecs_attr = f"{_avc_codec_tag(h)},mp4a.40.2"
-
                 lines += [
                     f"#EXT-X-STREAM-INF:BANDWIDTH={total_br_bps},RESOLUTION={w}x{h},"
                     f'CODECS="{codecs_attr}",FRAME-RATE={fps_val:.3f}',
@@ -2035,15 +1701,12 @@ def make_hls(
                 ]
             else:
                 errors.append(f"{h}p failed")
-
         except subprocess.TimeoutExpired:
             errors.append(f"{h}p failed: timeout")
         except Exception as e:
             errors.append(f"{h}p failed: {e}")
-
     master = od / "master.m3u8"
     master.write_text("\n".join(lines), encoding="utf-8")
-
     return master, log, errors
 
 
@@ -2056,78 +1719,39 @@ def make_dash(
 ) -> Tuple[Path, Path, List[str]]:
     """
     NEW (V4.1): real MPEG-DASH packaging using ffmpeg's native `dash` muxer.
-
-    Rather than encoding each rung to a separate file and hand-writing an
-    MPD (fragile, and easy to get segment-alignment/timeline math wrong),
-    this builds ONE ffmpeg command that:
-      1. Splits the input video stream once per rung via filter_complex
-         (`split=N`), then scales+pads each split to its rung's resolution.
-      2. Maps each scaled output as its own video stream (-map "[vN]") plus
-         one shared audio stream, and sets per-stream encode options with
-         ffmpeg's indexed syntax (-c:v:0, -b:v:0, -c:v:1, -b:v:1, ...).
-      3. Muxes everything with `-f dash`, using -use_template/-use_timeline
-         so segments are named predictably, and -adaptation_sets to group
-         all video renditions into one switchable set and audio into
-         another — this is what makes the output truly adaptive (a single
-         <AdaptationSet> with multiple <Representation> elements the player
-         can switch between), not just N independent DASH streams.
-
-    Returns (manifest_path, log_path, errors) to match make_hls()'s shape,
-    so both can be called interchangeably from the ABR tab / zipped up the
-    same way.
-
-    Requires an ffmpeg build with the `dash` muxer (checked via has_muxer);
-    if missing, returns no manifest and a single explanatory error string.
     """
     log = LOG_DIR / f"{sid}.log"
     od = OUT_DIR / f"dash_{sid[:8]}"
     od.mkdir(exist_ok=True)
-
     errors: List[str] = []
     manifest = od / "manifest.mpd"
-
     info = ffinfo()
     if not info["ffmpeg"]:
         return manifest, log, ["FFmpeg missing."]
-
     if not has_muxer("dash"):
         errors.append("This ffmpeg build has no `dash` muxer — DASH packaging unavailable. Use HLS instead.")
         return manifest, log, errors
-
     rungs = ladder if ladder else DEFAULT_LADDER
     n = len(rungs)
-
     if n == 0:
         errors.append("No ladder rungs to package.")
         return manifest, log, errors
-
     fps_val = source_fps if source_fps and source_fps > 0 else 30.0
     audio_br_k = int(audio_bitrate)
     enc = "libx264" if has_encoder("libx264") else "h264"
-
-    # ---- Build filter_complex: split the source video into N copies, then
-    # scale+pad each copy to its rung's target resolution. ----
     split_labels = "".join(f"[vin{i}]" for i in range(n))
     filter_parts = [f"[0:v]split={n}{split_labels}"]
-
     for i, r in enumerate(rungs):
         w, h = r["w"], r["h"]
         filter_parts.append(
             f"[vin{i}]scale=w={w}:h={h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2[v{i}]"
         )
-
     filter_complex = ";".join(filter_parts)
-
     cmd = [info["ffmpeg"], "-hide_banner", "-y", "-i", str(src), "-filter_complex", filter_complex]
-
-    # ---- Map each scaled video rendition + one shared audio track. ----
     for i in range(n):
         cmd += ["-map", f"[v{i}]"]
     cmd += ["-map", "0:a?"]
-
-    # ---- Per-rendition video encode settings (indexed :0, :1, ... match
-    # the order streams were -map'ped above). ----
     gop = max(24, int(round(fps_val * 2)))
     for i, r in enumerate(rungs):
         br_k = r["bitrate_kbps"]
@@ -2141,11 +1765,7 @@ def make_dash(
             f"-keyint_min:v:{i}", str(gop),
             f"-sc_threshold:v:{i}", "0",
         ]
-
     cmd += ["-c:a", "aac", "-b:a", f"{audio_br_k}k", "-ar", "48000"]
-
-    # ---- DASH muxer options: template + timeline addressing, one
-    # AdaptationSet for video (switchable) and one for audio. ----
     cmd += [
         "-f", "dash",
         "-seg_duration", "4",
@@ -2156,59 +1776,31 @@ def make_dash(
         "-media_seg_name", "chunk-stream$RepresentationID$-$Number%05d$.m4s",
         str(manifest),
     ]
-
     try:
         p = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=3600,
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=3600,
         )
-
         with log.open("a", encoding="utf-8") as f:
             f.write("\n$ " + " ".join(map(str, cmd)) + "\n" + (p.stdout or ""))
-
         if p.returncode != 0 or not manifest.exists():
             errors.append("DASH packaging failed.")
             tail = "\n".join((p.stdout or "").splitlines()[-40:])
             if tail:
                 errors.append(tail)
-
     except subprocess.TimeoutExpired:
         errors.append("DASH packaging failed: timeout")
     except Exception as e:
         errors.append(f"DASH packaging failed: {e}")
-
     return manifest, log, errors
-
 
 # ============================================================
 # CSV logging
 # ============================================================
-
 CSV_FIELDS = [
-    "timestamp",
-    "source",
-    "output",
-    "mode",
-    "profile",
-    "codec",
-    "actual_encoder",
-    "crf",
-    "preset",
-    "target_mb",
-    "source_mb",
-    "output_mb",
-    "saved_pct",
-    "grain_removal",
-    "deband",
-    "strict_vbv",
-    "PSNR",
-    "SSIM",
-    "VMAF",
-    "VMAF_proxy",
-    "log",
+    "timestamp", "source", "output", "mode", "profile", "codec",
+    "actual_encoder", "crf", "preset", "target_mb", "source_mb",
+    "output_mb", "saved_pct", "grain_removal", "deband", "strict_vbv",
+    "PSNR", "SSIM", "VMAF", "VMAF_proxy", "log",
 ]
 
 
@@ -2216,32 +1808,15 @@ def csvrow(row: Dict[str, Any]):
     p = LOG_DIR / "sessions.csv"
     new = not p.exists()
     full = {k: row.get(k, "") for k in CSV_FIELDS}
-
     with p.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         if new:
             w.writeheader()
         w.writerow(full)
 
-
 # ============================================================
 # File-based QC (V4.2)
 # ============================================================
-#
-# Scope (Phase 1, per product decision): container integrity, video/audio
-# spec compliance, black/freeze frame detection, silence/clipping/phase/
-# loudness (EBU R128 / ATSC A/85). Subtitle/CC QC and true macroblocking/
-# banding artifact detection are explicitly OUT of scope here — they need
-# tooling (pycaption for SCC/TTML, a trained artifact model) this module
-# doesn't have, and are flagged as "unverified" rather than silently
-# skipped or falsely asserted.
-#
-# All checks return a flat dict: {"category","check","status","detail"}
-# with status in {"pass","warn","fail"}. run_qc() aggregates these into a
-# single verdict: FAIL if any check failed, else WARNING if any warned,
-# else PASS. This mirrors a real broadcast QC engine's pass/warn/fail
-# semantics without pretending to be one.
-
 QC_SPECS: Dict[str, Dict[str, Any]] = {
     "🌐 Web / VOD Generic": {
         "video_codecs": ["h264", "hevc", "vp9", "av1"],
@@ -2298,147 +1873,90 @@ def _qc_check(category: str, check: str, status: str, detail: str) -> Dict[str, 
     return {"category": category, "check": check, "status": status, "detail": detail}
 
 
-def qc_container_checks(
-    meta: Dict[str, Any],
-    probe_data: Dict[str, Any],
-) -> List[Dict[str, str]]:
+def qc_container_checks(meta: Dict[str, Any], probe_data: Dict[str, Any]) -> List[Dict[str, str]]:
     checks: List[Dict[str, str]] = []
     fmt = probe_data.get("format", {}) if probe_data else {}
-
     if not probe_data or not fmt:
-        checks.append(_qc_check(
-            "Container", "Parseability", "fail",
-            "ffprobe could not parse this file — container may be corrupt, truncated, or an unsupported format.",
-        ))
+        checks.append(_qc_check("Container", "Parseability", "fail", "ffprobe could not parse this file."))
         return checks
-
     checks.append(_qc_check("Container", "Parseability", "pass", "File parsed cleanly by ffprobe."))
-
     streams = probe_data.get("streams", [])
     n_video = sum(1 for s in streams if s.get("codec_type") == "video")
     n_audio = sum(1 for s in streams if s.get("codec_type") == "audio")
     n_subs = sum(1 for s in streams if s.get("codec_type") == "subtitle")
-
     if n_video == 0:
         checks.append(_qc_check("Container", "Video track presence", "fail", "No video stream detected."))
     else:
         checks.append(_qc_check("Container", "Video track presence", "pass", f"{n_video} video stream(s) present."))
-
     if n_audio == 0:
         checks.append(_qc_check("Container", "Audio track presence", "warn", "No audio stream detected."))
     else:
         checks.append(_qc_check("Container", "Audio track presence", "pass", f"{n_audio} audio stream(s) present."))
-
-    checks.append(_qc_check(
-        "Container", "Subtitle track count", "pass",
-        f"{n_subs} subtitle stream(s) embedded. (Subtitle/CC structural QC is a separate module — not covered here.)",
-    ))
-
+    checks.append(_qc_check("Container", "Subtitle track count", "pass", f"{n_subs} subtitle stream(s) embedded."))
     fmt_dur = float(fmt.get("duration", 0) or 0)
     vstream = next((s for s in streams if s.get("codec_type") == "video"), {})
     try:
         vstream_dur = float(vstream.get("duration")) if vstream.get("duration") else fmt_dur
     except (TypeError, ValueError):
         vstream_dur = fmt_dur
-
     if fmt_dur > 0 and vstream_dur > 0:
         drift = abs(fmt_dur - vstream_dur)
         if drift > 0.5:
-            checks.append(_qc_check(
-                "Container", "Duration consistency", "warn",
-                f"Container duration {fmt_dur:.2f}s vs. video stream duration {vstream_dur:.2f}s (drift {drift:.2f}s).",
-            ))
+            checks.append(_qc_check("Container", "Duration consistency", "warn", f"Drift {drift:.2f}s."))
         else:
-            checks.append(_qc_check(
-                "Container", "Duration consistency", "pass",
-                f"Container and video stream duration consistent ({fmt_dur:.2f}s).",
-            ))
+            checks.append(_qc_check("Container", "Duration consistency", "pass", f"Consistent ({fmt_dur:.2f}s)."))
     else:
-        checks.append(_qc_check(
-            "Container", "Duration consistency", "warn",
-            "Could not determine a reliable duration from stream metadata.",
-        ))
-
+        checks.append(_qc_check("Container", "Duration consistency", "warn", "Could not determine reliable duration."))
     return checks
 
 
 def qc_video_spec_checks(meta: Dict[str, Any], spec: Dict[str, Any]) -> List[Dict[str, str]]:
     checks: List[Dict[str, str]] = []
     vcodec = (meta.get("vcodec") or "").lower()
-
     if spec["video_codecs"] and vcodec not in spec["video_codecs"]:
-        checks.append(_qc_check(
-            "Video", "Codec compliance", "fail",
-            f"Codec '{vcodec}' is not in the allowed set {spec['video_codecs']} for this delivery spec.",
-        ))
+        checks.append(_qc_check("Video", "Codec compliance", "fail", f"Codec '{vcodec}' not allowed."))
     else:
         checks.append(_qc_check("Video", "Codec compliance", "pass", f"Codec '{vcodec}' allowed."))
-
     w, h = meta.get("width", 0), meta.get("height", 0)
     if w < spec["min_width"] or h < spec["min_height"]:
-        checks.append(_qc_check(
-            "Video", "Resolution", "fail",
-            f"{w}x{h} is below the minimum {spec['min_width']}x{spec['min_height']} required by this spec.",
-        ))
+        checks.append(_qc_check("Video", "Resolution", "fail", f"{w}x{h} below minimum."))
     else:
-        checks.append(_qc_check("Video", "Resolution", "pass", f"{w}x{h} meets the minimum resolution."))
-
+        checks.append(_qc_check("Video", "Resolution", "pass", f"{w}x{h} meets minimum."))
     fps = meta.get("fps", 0)
     lo, hi = spec["fps_range"]
     if not (lo <= fps <= hi):
-        checks.append(_qc_check(
-            "Video", "Frame rate", "warn",
-            f"{fps:.2f} fps is outside the expected range {lo:g}-{hi:g} fps for this spec.",
-        ))
+        checks.append(_qc_check("Video", "Frame rate", "warn", f"{fps:.2f} fps outside range."))
     else:
-        checks.append(_qc_check("Video", "Frame rate", "pass", f"{fps:.2f} fps within expected range."))
-
+        checks.append(_qc_check("Video", "Frame rate", "pass", f"{fps:.2f} fps within range."))
     if w and h:
         ar = w / h
         common = [16 / 9, 4 / 3, 9 / 16, 1.0, 21 / 9]
         if not any(abs(ar - c) < 0.03 for c in common):
-            checks.append(_qc_check(
-                "Video", "Aspect ratio", "warn",
-                f"Aspect ratio {ar:.3f} doesn't match a common preset (16:9, 4:3, 9:16, 1:1, 21:9) — verify this is intentional.",
-            ))
+            checks.append(_qc_check("Video", "Aspect ratio", "warn", f"AR {ar:.3f} non-standard."))
         else:
-            checks.append(_qc_check("Video", "Aspect ratio", "pass", f"Aspect ratio {ar:.3f} matches a standard preset."))
-
+            checks.append(_qc_check("Video", "Aspect ratio", "pass", f"AR {ar:.3f} standard."))
     return checks
 
 
 def qc_audio_spec_checks(meta: Dict[str, Any], spec: Dict[str, Any]) -> List[Dict[str, str]]:
     checks: List[Dict[str, str]] = []
-
     if not meta.get("has_audio"):
-        return checks  # already flagged at the container level
-
+        return checks
     acodec = (meta.get("acodec") or "").lower()
     if spec["audio_codecs"] and acodec not in spec["audio_codecs"]:
-        checks.append(_qc_check(
-            "Audio", "Codec compliance", "fail",
-            f"Codec '{acodec}' is not in the allowed set {spec['audio_codecs']} for this spec.",
-        ))
+        checks.append(_qc_check("Audio", "Codec compliance", "fail", f"Codec '{acodec}' not allowed."))
     else:
         checks.append(_qc_check("Audio", "Codec compliance", "pass", f"Codec '{acodec}' allowed."))
-
     sr = meta.get("sample_rate", 0)
     if spec["sample_rates"] and sr not in spec["sample_rates"]:
-        checks.append(_qc_check(
-            "Audio", "Sample rate", "warn", f"{sr} Hz is not in the expected set {spec['sample_rates']}.",
-        ))
+        checks.append(_qc_check("Audio", "Sample rate", "warn", f"{sr} Hz not expected."))
     else:
         checks.append(_qc_check("Audio", "Sample rate", "pass", f"{sr} Hz OK."))
-
     ch = meta.get("channels", 0)
     if spec["channels"] and ch not in spec["channels"]:
-        checks.append(_qc_check(
-            "Audio", "Channel configuration", "warn",
-            f"{ch} channel(s) not in the expected set {spec['channels']}.",
-        ))
+        checks.append(_qc_check("Audio", "Channel configuration", "warn", f"{ch} ch not expected."))
     else:
-        checks.append(_qc_check("Audio", "Channel configuration", "pass", f"{ch} channel(s) OK."))
-
+        checks.append(_qc_check("Audio", "Channel configuration", "pass", f"{ch} ch OK."))
     return checks
 
 
@@ -2446,14 +1964,12 @@ def qc_metadata_checks(probe_data: Dict[str, Any], spec: Dict[str, Any]) -> List
     checks: List[Dict[str, str]] = []
     fmt = probe_data.get("format", {}) if probe_data else {}
     tags = {str(k).lower(): v for k, v in (fmt.get("tags") or {}).items()}
-
     for req in spec.get("required_tags", []):
         val = tags.get(req.lower())
         if not val or not str(val).strip():
-            checks.append(_qc_check("Metadata", f"Tag '{req}'", "warn", f"Required tag '{req}' is missing or empty."))
+            checks.append(_qc_check("Metadata", f"Tag '{req}'", "warn", f"Required tag '{req}' missing."))
         else:
             checks.append(_qc_check("Metadata", f"Tag '{req}'", "pass", f"'{req}' = {val}"))
-
     return checks
 
 
@@ -2465,31 +1981,21 @@ def qc_run_filters(
     sample_seconds: Optional[float] = None,
 ) -> List[Dict[str, str]]:
     """
-    Single decode pass running blackdetect + freezedetect on video and
-    silencedetect + astats + ebur128 + aphasemeter on audio. All five
-    filters are non-destructive pass-throughs, so they're chained into one
-    decode instead of five separate passes over the file.
-
-    sample_seconds caps analysis to the first N seconds (quick mode on long
-    files); None analyzes the full duration.
+    Single decode pass running blackdetect + freezedetect + silencedetect +
+    astats + ebur128 + aphasemeter.
     """
     checks: List[Dict[str, str]] = []
     info = ffinfo()
-
     if not info["ffmpeg"]:
-        checks.append(_qc_check("System", "FFmpeg availability", "fail", "FFmpeg is not available — cannot run filter-based QC."))
+        checks.append(_qc_check("System", "FFmpeg availability", "fail", "FFmpeg not available."))
         return checks
-
     log = LOG_DIR / f"{sid}_qc.log"
     duration = meta.get("duration", 0) or 0
     has_audio = bool(meta.get("has_audio"))
-
     cmd = [info["ffmpeg"], "-hide_banner", "-nostats", "-y", "-i", str(path)]
     if sample_seconds and sample_seconds > 0:
         cmd += ["-t", str(sample_seconds)]
-
     cmd += ["-vf", "blackdetect=d=0.5:pic_th=0.98,freezedetect=n=-60dB:d=2"]
-
     if has_audio:
         af = (
             "silencedetect=noise=-30dB:d=0.5,"
@@ -2501,12 +2007,9 @@ def qc_run_filters(
         cmd += ["-af", af]
     else:
         cmd += ["-an"]
-
     cmd += ["-f", "null", os.devnull]
-
     out = run_ffmpeg(cmd, log, timeout=1800)
 
-    # ---- Black frames ----
     black_hits = re.findall(
         r"black_start:\s*([\d.]+)\s+black_end:\s*([\d.]+)\s+black_duration:\s*([\d.]+)", out,
     )
@@ -2514,128 +2017,88 @@ def qc_run_filters(
         total_black = sum(float(d) for _, _, d in black_hits)
         worst = max(black_hits, key=lambda x: float(x[2]))
         status = "fail" if total_black > max(2.0, duration * 0.02) else "warn"
-        checks.append(_qc_check(
-            "Video", "Black frames", status,
-            f"{len(black_hits)} black segment(s), {total_black:.2f}s total. Longest: {worst[0]}s-{worst[1]}s ({worst[2]}s).",
-        ))
+        checks.append(_qc_check("Video", "Black frames", status,
+            f"{len(black_hits)} segment(s), {total_black:.2f}s total. Longest: {worst[2]}s."))
     else:
-        checks.append(_qc_check("Video", "Black frames", "pass", "No unexpected black segments detected."))
+        checks.append(_qc_check("Video", "Black frames", "pass", "No unexpected black segments."))
 
-    # ---- Frozen frames ----
     freeze_starts = re.findall(r"freeze_start:\s*([\d.]+)", out)
     freeze_durs = [float(d) for d in re.findall(r"freeze_duration:\s*([\d.]+)", out)]
     if freeze_starts:
         total_freeze = sum(freeze_durs)
         status = "fail" if total_freeze > max(2.0, duration * 0.02) else "warn"
-        starts_preview = ", ".join(freeze_starts[:5]) + ("…" if len(freeze_starts) > 5 else "")
-        checks.append(_qc_check(
-            "Video", "Frozen frames", status,
-            f"{len(freeze_starts)} freeze segment(s), {total_freeze:.2f}s total. Start(s): {starts_preview}.",
-        ))
+        checks.append(_qc_check("Video", "Frozen frames", status,
+            f"{len(freeze_starts)} segment(s), {total_freeze:.2f}s total."))
     else:
-        checks.append(_qc_check("Video", "Frozen frames", "pass", "No frozen/stuck frames detected."))
+        checks.append(_qc_check("Video", "Frozen frames", "pass", "No frozen/stuck frames."))
 
-    checks.append(_qc_check(
-        "Video", "Macroblocking / artifacts", "warn",
-        "Not reliably detectable with stock FFmpeg filters — this needs a dedicated artifact-detection model "
-        "(e.g. Interra Baton, Tektronix). Treat as unverified, not gated.",
-    ))
-    checks.append(_qc_check(
-        "Video", "Color banding", "warn",
-        "Not reliably detectable with stock FFmpeg filters — treat as unverified. Consider the app's Perceptual "
-        "Debanding toggle proactively on gradient-heavy sources.",
-    ))
+    checks.append(_qc_check("Video", "Macroblocking / artifacts", "warn", "Unverified (requires dedicated model)."))
+    checks.append(_qc_check("Video", "Color banding", "warn", "Unverified (consider Perceptual Debanding toggle)."))
 
     if has_audio:
-        # ---- Silence ----
         sil_starts = re.findall(r"silence_start:\s*([\d.]+)", out)
         sil_durs = [float(d) for d in re.findall(r"silence_duration:\s*([\d.]+)", out)]
         if sil_starts:
             total_sil = sum(sil_durs)
             status = "fail" if total_sil > max(3.0, duration * 0.05) else "warn"
-            checks.append(_qc_check(
-                "Audio", "Silence", status, f"{len(sil_starts)} silence segment(s), {total_sil:.2f}s total.",
-            ))
+            checks.append(_qc_check("Audio", "Silence", status, f"{len(sil_starts)} segment(s), {total_sil:.2f}s total."))
         else:
-            checks.append(_qc_check("Audio", "Silence", "pass", "No unexpected silence detected."))
+            checks.append(_qc_check("Audio", "Silence", "pass", "No unexpected silence."))
 
-        # ---- Clipping (astats "Overall" block) ----
         overall_block = out.split("Overall")[-1] if "Overall" in out else out
         clip_matches = re.findall(r"Number of clipped samples:\s*(\d+)", overall_block)
         peak_matches = re.findall(r"Peak level dB:\s*(-?inf|-?[\d.]+)", overall_block)
         clipped = int(clip_matches[0]) if clip_matches else 0
         peak_db = peak_matches[0] if peak_matches else None
-
         if clipped > 0:
             status = "fail" if clipped > 100 else "warn"
-            detail = f"{clipped} clipped sample(s) detected." + (f" Peak level: {peak_db} dB." if peak_db else "")
+            detail = f"{clipped} clipped sample(s)." + (f" Peak: {peak_db} dB." if peak_db else "")
             checks.append(_qc_check("Audio", "Clipping/distortion", status, detail))
         else:
-            detail = "No clipped samples detected." + (f" Peak level: {peak_db} dB." if peak_db else "")
+            detail = "No clipped samples." + (f" Peak: {peak_db} dB." if peak_db else "")
             checks.append(_qc_check("Audio", "Clipping/distortion", "pass", detail))
 
-        # ---- Phase correlation ----
         phase_vals = [float(v) for v in re.findall(r"lavfi\.aphasemeter\.phase=([\-0-9.]+)", out)]
         if phase_vals:
             avg_phase = sum(phase_vals) / len(phase_vals)
             min_phase = min(phase_vals)
             if avg_phase < -0.5 or min_phase < -0.9:
-                checks.append(_qc_check(
-                    "Audio", "Phase correlation", "fail",
-                    f"Average correlation {avg_phase:.2f}, minimum {min_phase:.2f} — likely out-of-phase / mono-cancellation risk.",
-                ))
+                checks.append(_qc_check("Audio", "Phase correlation", "fail",
+                    f"Avg {avg_phase:.2f}, min {min_phase:.2f} — out-of-phase risk."))
             elif avg_phase < 0.2:
-                checks.append(_qc_check(
-                    "Audio", "Phase correlation", "warn",
-                    f"Average correlation {avg_phase:.2f} — borderline mono compatibility.",
-                ))
+                checks.append(_qc_check("Audio", "Phase correlation", "warn",
+                    f"Avg {avg_phase:.2f} — borderline mono compatibility."))
             else:
-                checks.append(_qc_check(
-                    "Audio", "Phase correlation", "pass", f"Average correlation {avg_phase:.2f} — good mono compatibility.",
-                ))
+                checks.append(_qc_check("Audio", "Phase correlation", "pass",
+                    f"Avg {avg_phase:.2f} — good mono compatibility."))
         else:
-            checks.append(_qc_check(
-                "Audio", "Phase correlation", "warn",
-                "Could not compute phase correlation (mono source, or aphasemeter unavailable in this ffmpeg build).",
-            ))
+            checks.append(_qc_check("Audio", "Phase correlation", "warn", "Could not compute phase correlation."))
 
-        # ---- Loudness (EBU R128 / ATSC A/85 via ebur128 summary) ----
-        i_match = re.search(r"Integrated loudness:\s*\n\s*I:\s*(-?[\d.]+) LUFS", out)
-        lra_match = re.search(r"Loudness range:\s*\n\s*LRA:\s*([\d.]+) LU", out)
-        peak_match = re.search(r"True peak:\s*\n\s*Peak:\s*(-?[\d.]+) dBFS", out)
-
+        # [FIX-4] More forgiving regex for EBU R128 loudness (handles FFmpeg output variations)
+        i_match = re.search(r"Integrated loudness:\s*I:\s*(-?[\d.]+)\s*LUFS", out)
+        lra_match = re.search(r"Loudness range:\s*LRA:\s*([\d.]+)\s*LU", out)
+        peak_match = re.search(r"True peak:\s*Peak:\s*(-?[\d.]+)\s*dBFS", out)
         integrated = float(i_match.group(1)) if i_match else None
         lra = float(lra_match.group(1)) if lra_match else None
         true_peak = float(peak_match.group(1)) if peak_match else None
-
         target = spec.get("loudness_target_lufs")
         tol = spec.get("loudness_tolerance_lu", 2.0)
         tp_max = spec.get("true_peak_max_dbfs", -1.0)
 
         if integrated is None:
-            checks.append(_qc_check(
-                "Audio", "Loudness (Integrated)", "warn",
-                "Could not measure integrated loudness (libebur128 unavailable, or audio too short to converge).",
-            ))
+            checks.append(_qc_check("Audio", "Loudness (Integrated)", "warn", "Could not measure integrated loudness."))
         elif target is None:
-            checks.append(_qc_check(
-                "Audio", "Loudness (Integrated)", "pass", f"Measured {integrated:.1f} LUFS (no target enforced for this spec).",
-            ))
+            checks.append(_qc_check("Audio", "Loudness (Integrated)", "pass", f"Measured {integrated:.1f} LUFS (no target)."))
         else:
             drift = abs(integrated - target)
             status = "pass" if drift <= tol else ("warn" if drift <= tol * 2 else "fail")
-            checks.append(_qc_check(
-                "Audio", "Loudness (Integrated)", status,
-                f"Measured {integrated:.1f} LUFS vs. target {target:.1f} LUFS ±{tol:.1f} LU (drift {drift:.1f} LU).",
-            ))
-
+            checks.append(_qc_check("Audio", "Loudness (Integrated)", status,
+                f"Measured {integrated:.1f} LUFS vs target {target:.1f} LUFS (drift {drift:.1f} LU)."))
         if true_peak is not None:
             status = "pass" if true_peak <= tp_max else "fail"
-            checks.append(_qc_check("Audio", "True peak", status, f"Measured {true_peak:.1f} dBFS vs. max {tp_max:.1f} dBFS."))
-
+            checks.append(_qc_check("Audio", "True peak", status, f"Measured {true_peak:.1f} dBFS vs max {tp_max:.1f} dBFS."))
         if lra is not None:
-            checks.append(_qc_check("Audio", "Loudness range", "pass", f"LRA {lra:.1f} LU (informational, not gated)."))
-
+            checks.append(_qc_check("Audio", "Loudness range", "pass", f"LRA {lra:.1f} LU."))
     return checks
 
 
@@ -2649,22 +2112,17 @@ def run_qc(
 ) -> Dict[str, Any]:
     spec = QC_SPECS[spec_name]
     probe_data = probe(path)
-
     checks: List[Dict[str, str]] = []
     checks += qc_container_checks(meta, probe_data)
     checks += qc_video_spec_checks(meta, spec)
     checks += qc_audio_spec_checks(meta, spec)
     checks += qc_metadata_checks(probe_data, spec)
-
     if run_filters:
         checks += qc_run_filters(path, meta, spec, sid, sample_seconds)
-
     n_fail = sum(1 for c in checks if c["status"] == "fail")
     n_warn = sum(1 for c in checks if c["status"] == "warn")
     n_pass = sum(1 for c in checks if c["status"] == "pass")
-
     verdict = "FAIL" if n_fail else ("WARNING" if n_warn else "PASS")
-
     return {
         "file": path.name,
         "spec": spec_name,
@@ -2676,11 +2134,9 @@ def run_qc(
         "timestamp": datetime.now().isoformat(timespec="seconds"),
     }
 
-
 # ============================================================
 # Render helpers
 # ============================================================
-
 def render_metric(label: str, value: str, sub: str = ""):
     sub_html = f"<div class='metric-sub'>{sub}</div>" if sub else ""
     st.markdown(
@@ -2702,52 +2158,33 @@ def toast(msg: str, icon: str = "✅"):
 
 def player(path: Path, poster: Optional[Path], mime: str):
     """
-    Universal inline player. IMPORTANT: the <video> element must contain a
-    proper <source> tag — if it doesn't, browsers fall back to rendering the
-    element's raw text content, which here would be a multi-megabyte base64
-    string dumped visibly into the page.
-
-    CHANGED (V4.2): components.html() does NOT auto-size to its content —
-    passing height=None silently falls back to Streamlit's small default
-    iframe height, which was clipping/cropping the video vertically (it
-    looked "zoomed in" because only the middle slice of the frame was ever
-    visible). Fixed by:
-      1. Giving components.html an explicit numeric height.
-      2. Sizing the container from the video's real aspect ratio (via
-         media()) and using object-fit:contain inside a centered flexbox,
-         so the whole frame is always visible — letterboxed if needed —
-         regardless of the source's aspect ratio (16:9, 9:16, square, etc).
+    Universal inline player.
+    CHANGED (V4.2): components.html() sizing fix so video isn't cropped.
+    [FIX-6] Inline base64 limit lowered from 25MB to 10MB to protect server RAM.
+    A 25MB video becomes ~33MB in server RAM via base64 encoding. On free
+    Streamlit Cloud (1GB RAM), two concurrent users would OOM the server.
+    Files over 10MB fall back to st.video() which streams efficiently.
     """
     if not path or not path.exists():
         return
-
-    inline_limit_mb = 25
-
+    # [FIX-6] Lowered from 25MB to 10MB for server RAM safety
+    inline_limit_mb = 10
     if path.stat().st_size > inline_limit_mb * 1024 * 1024:
         st.video(str(path))
         return
-
     vb64 = base64.b64encode(path.read_bytes()).decode()
     pa = ""
-
     if poster and poster.exists() and poster.stat().st_size < 5 * 1024 * 1024:
         pm = "image/png" if poster.suffix.lower() == ".png" else "image/jpeg"
         pa = f"poster='data:{pm};base64,{base64.b64encode(poster.read_bytes()).decode()}'"
-
-    # CHANGED (V4.2): compute a real display height from the video's own
-    # aspect ratio instead of relying on CSS width:100%/height:auto inside
-    # an unsized iframe (which was the root cause of the cropping).
     vmeta = media(path)
     vw, vh = vmeta.get("width") or 16, vmeta.get("height") or 9
     aspect = vh / vw if vw else 9 / 16
-
     max_display_h = 520
-    chrome_px = 24  # container padding (10px) + border (2px), top and bottom
-
-    display_h = min(max_display_h, int(720 * aspect))  # 720 ~= a typical rendered column width
-    display_h = max(display_h, 200)  # sane floor for very wide/short (e.g. ultra-panoramic) sources
+    chrome_px = 24
+    display_h = min(max_display_h, int(720 * aspect))
+    display_h = max(display_h, 200)
     iframe_h = display_h + chrome_px
-
     components.html(
         f"""
         <div class='video-player-container' style='background:#fff;border:1px solid #e5edf5;border-radius:14px;
@@ -2763,54 +2200,40 @@ def player(path: Path, poster: Optional[Path], mime: str):
         height=iframe_h,
     )
 
-
 # ============================================================
 # Session state
 # ============================================================
-
 for k in [
-    "src",
-    "out",
-    "img",
-    "src_meta",
-    "last_metrics",
-    "last_md",
-    "last_log",
-    "upload_src_id",
-    "upload_img_id",
-    "_last_preset_import",
-    "qc_last_report",
-    "qc_last_file",
+    "src", "out", "img", "src_meta", "last_metrics", "last_md", "last_log",
+    "upload_src_id", "upload_img_id", "_last_preset_import",
+    "qc_last_report", "qc_last_file",
 ]:
     if k not in st.session_state:
         st.session_state[k] = None
 
-
 # ============================================================
 # Header
 # ============================================================
-
 info = ffinfo()
 av1_ready = has_encoder("libsvtav1") or has_encoder("libaom-av1")
-
 st.markdown(
     f"""
-<div class='hero'>
-  <h1>🎬 VideoForge Studio <span style='font-size:1.1rem;font-weight:700;color:#059669'>V4.0 Enterprise</span></h1>
-  <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep with VMAF knee detection, ABR packaging, batch processing, and file-based QC.</p>
-  <div style='margin-top:12px'>
-    <span class='badge'>{'✅' if info['ffmpeg'] else '❌'} FFmpeg</span>
-    <span class='badge'>{'✅' if has_encoder('libx264') else '⚠️'} H.264</span>
-    <span class='badge'>{'✅' if has_encoder('libx265') else '⚠️'} HEVC</span>
-    <span class='badge'>{'✅' if av1_ready else '⚠️'} AV1</span>
-    <span class='badge'>{'✅' if has_filter('libvmaf') else '⚠️'} VMAF</span>
-    <span class='badge'>{'✅' if has_filter('signalstats') else '⚠️'} Per-title analysis</span>
-    <span class='badge'>{'✅' if has_muxer('dash') else '⚠️'} DASH</span>
-    <span class='badge'>{'✅' if has_filter('ebur128') else '⚠️'} EBU R128 loudness</span>
-    <span class='badge badge-enterprise'>🧠 10-bit + psycho-visual RC</span>
-  </div>
-</div>
-""",
+    <div class='hero'>
+        <h1>🎬 VideoForge Studio <span style='font-size:1.1rem;font-weight:700;color:#059669'>V4.2 Enterprise</span></h1>
+        <p>Professional video optimization platform — intent-based encoding, target-size control, smart enhancement, side-by-side analysis, CRF sweep with VMAF knee detection, ABR packaging, batch processing, and file-based QC.</p>
+        <div style='margin-top:12px'>
+            <span class='badge'>{'✅' if info['ffmpeg'] else '❌'} FFmpeg</span>
+            <span class='badge'>{'✅' if has_encoder('libx264') else '⚠️'} H.264</span>
+            <span class='badge'>{'✅' if has_encoder('libx265') else '⚠️'} HEVC</span>
+            <span class='badge'>{'✅' if av1_ready else '⚠️'} AV1</span>
+            <span class='badge'>{'✅' if has_filter('libvmaf') else '⚠️'} VMAF</span>
+            <span class='badge'>{'✅' if has_filter('signalstats') else '⚠️'} Per-title analysis</span>
+            <span class='badge'>{'✅' if has_muxer('dash') else '⚠️'} DASH</span>
+            <span class='badge'>{'✅' if has_filter('ebur128') else '⚠️'} EBU R128 loudness</span>
+            <span class='badge badge-enterprise'>🧠 10-bit + psycho-visual RC</span>
+        </div>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
@@ -2818,27 +2241,20 @@ if not info["ffmpeg"]:
     st.error("FFmpeg is missing. Repo must contain `packages.txt` with `ffmpeg` inside, then redeploy.")
     st.stop()
 
-
 # ============================================================
 # Tabs
 # ============================================================
-
 tab_work, tab_batch, tab_compare, tab_player, tab_quality, tab_sweep, tab_abr, tab_qc, tab_logs = st.tabs(
     ["🛠️ Workflow", "📦 Batch", "🆚 Compare", "▶️ Player", "📊 Quality", "📈 CRF Sweep", "📡 ABR", "✅ QC", "🪵 Logs"]
 )
 
-
 # ============================================================
 # Workflow tab
 # ============================================================
-
 with tab_work:
-
-    # -------- Presets (export / import) --------
     with st.expander("💾 Presets", expanded=False):
         st.caption("Save your current encoder settings to a JSON file, or load a previously saved preset.")
         pcol1, pcol2 = st.columns(2)
-
         with pcol1:
             preset_file = st.file_uploader("Import settings JSON", type=["json"], key="preset_import")
             if preset_file and st.session_state.get("_last_preset_import") != preset_file.name:
@@ -2851,7 +2267,6 @@ with tab_work:
                     st.rerun()
                 except Exception as e:
                     st.error(f"Could not read preset file: {e}")
-
         with pcol2:
             _preset_keys = [
                 "wf_mode", "wf_goal", "wf_profile_override", "wf_codec_target", "wf_codec_crf",
@@ -2868,21 +2283,13 @@ with tab_work:
                 "videoforge_preset.json",
                 "application/json",
                 disabled=not export_dict,
-                help="Encode at least once (or touch the settings below) so there's something to export." if not export_dict else None,
             )
 
     st.markdown("<div class='section-title'>Step 1 · Upload</div>", unsafe_allow_html=True)
-
     with st.container(border=True):
         cu1, cu2 = st.columns([1.2, 0.8], gap="large")
-
         with cu1:
-            up = st.file_uploader(
-                "Source video",
-                type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"],
-                key="upload_src",
-            )
-
+            up = st.file_uploader("Source video", type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"], key="upload_src")
             if up:
                 uid = upload_identity(up)
                 if st.session_state.get("upload_src_id") != uid:
@@ -2891,387 +2298,145 @@ with tab_work:
                     st.session_state.src = str(p)
                     st.session_state.src_meta = media(p)
                     st.success(f"Loaded: {p.name}")
-
         with cu2:
-            im = st.file_uploader(
-                "Image / logo / poster",
-                type=["png", "jpg", "jpeg", "webp"],
-                key="upload_img",
-            )
-
+            im = st.file_uploader("Image / logo / poster", type=["png", "jpg", "jpeg", "webp"], key="upload_img")
             if im:
                 iid = upload_identity(im)
                 if st.session_state.get("upload_img_id") != iid:
                     ip = save_upload(im, IN_DIR)
                     st.session_state.upload_img_id = iid
                     st.session_state.img = str(ip)
-
                 if st.session_state.img and Path(st.session_state.img).exists():
                     st.image(st.session_state.img, caption="Attached image", use_container_width=True)
-
         src_meta = st.session_state.src_meta or {}
-
         if src_meta:
             is_hdr = detect_hdr(src_meta)
             interp_ok, interp_msg = recommend_interpolation(src_meta)
-
             c1, c2, c3, c4, c5 = st.columns(5)
-            with c1:
-                render_metric("Resolution", f"{src_meta['width']}×{src_meta['height']}")
-            with c2:
-                render_metric("Codec", src_meta["vcodec"].upper())
-            with c3:
-                render_metric("FPS", f"{src_meta['fps']:.2f}")
-            with c4:
-                render_metric("Bitrate", f"{src_meta['bitrate_kbps']:.0f} kbps")
-            with c5:
-                render_metric("Size", f"{src_meta['size_mb']:.2f} MB")
-
-            st.markdown(
-                f"<div class='{'warn-strip' if is_hdr else 'ok-strip'}'>"
-                f"{'⚠️ HDR source detected' if is_hdr else '✅ SDR source detected — HDR conversion will be disabled.'}"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-
-            st.markdown(
-                f"<div class='{'warn-strip' if not interp_ok else 'info-strip'}'>🎞️ {interp_msg}</div>",
-                unsafe_allow_html=True,
-            )
+            with c1: render_metric("Resolution", f"{src_meta['width']}×{src_meta['height']}")
+            with c2: render_metric("Codec", src_meta["vcodec"].upper())
+            with c3: render_metric("FPS", f"{src_meta['fps']:.2f}")
+            with c4: render_metric("Bitrate", f"{src_meta['bitrate_kbps']:.0f} kbps")
+            with c5: render_metric("Size", f"{src_meta['size_mb']:.2f} MB")
+            st.markdown(f"<div class='{'warn-strip' if is_hdr else 'ok-strip'}'>{'⚠️ HDR source detected' if is_hdr else '✅ SDR source detected'}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='{'warn-strip' if not interp_ok else 'info-strip'}'>🎞️ {interp_msg}</div>", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-
     st.markdown("<div class='section-title'>Step 2 · Optimization Goal</div>", unsafe_allow_html=True)
-
     with st.container(border=True):
-        mode = st.radio(
-            "Output control",
-            ["Best quality at CRF", "Guaranteed target size"],
-            horizontal=True,
-            key="wf_mode",
-            help="CRF optimizes quality/compression but does not guarantee smaller output. Target size uses two-pass bitrate encoding.",
-        )
-
+        mode = st.radio("Output control", ["Best quality at CRF", "Guaranteed target size"], horizontal=True, key="wf_mode")
         is_target_mode = mode == "Guaranteed target size"
-
         if is_target_mode:
             profile_name = TARGET_PROFILE
             profile = PROFILES[profile_name]
         else:
-            goal = st.slider(
-                "Quality ◄────────► Size",
-                0,
-                100,
-                55,
-                key="wf_goal",
-                help="0 = max quality, 100 = smallest file",
-            )
+            goal = st.slider("Quality ◄────────► Size", 0, 100, 55, key="wf_goal")
             profile_name = map_slider_to_profile(goal)
             crf_profiles = [k for k in PROFILES.keys() if k != TARGET_PROFILE]
-            profile_name = st.selectbox(
-                "Profile override",
-                crf_profiles,
-                index=crf_profiles.index(profile_name),
-                key="wf_profile_override",
-            )
+            profile_name = st.selectbox("Profile override", crf_profiles, index=crf_profiles.index(profile_name), key="wf_profile_override")
             profile = PROFILES[profile_name]
-
         st.markdown(f"<div class='info-strip'>{profile['desc']}</div>", unsafe_allow_html=True)
-
         if is_target_mode:
             tc1, tc2, tc3, tc4 = st.columns(4)
-
-            with tc1:
-                codec = st.selectbox(
-                    "Codec",
-                    ["AVC (H.264)", "HEVC (H.265)", "AV1"],
-                    index=0,
-                    key="wf_codec_target",
-                    help="AV1 target-size requires libaom-av1. If unavailable, the app falls back to H.264 and shows a warning.",
-                )
-
-            with tc2:
-                target_mb = st.number_input(
-                    "Target size (MB)",
-                    min_value=1.0,
-                    max_value=20000.0,
-                    value=25.0,
-                    step=1.0,
-                    key="wf_target_mb",
-                )
-
-            with tc3:
-                target_audio_kbps = st.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="wf_target_audio_kbps")
-
-            with tc4:
-                preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2, key="wf_preset_target")
-
-            safety_margin_pct = st.slider(
-                "Safety margin",
-                2, 15, 6,
-                key="wf_safety_margin",
-                help="Encoder rate-control accuracy plus container overhead means an encode aimed exactly "
-                     "at the cap can occasionally land a little over it. This margin is subtracted before "
-                     "computing the target bitrate — raise it if you're hitting a hard limit (e.g. an "
-                     "upload cap) and can't afford any overshoot.",
-            )
-
-            if codec == "AV1":
-                st.caption("ℹ️ AV1 two-pass uses a fixed internal speed setting (cpu-used=6) — the Preset selector above is ignored for AV1.")
-
+            with tc1: codec = st.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], index=0, key="wf_codec_target")
+            with tc2: target_mb = st.number_input("Target size (MB)", min_value=1.0, max_value=20000.0, value=25.0, step=1.0, key="wf_target_mb")
+            with tc3: target_audio_kbps = st.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="wf_target_audio_kbps")
+            with tc4: preset = st.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=2, key="wf_preset_target")
+            safety_margin_pct = st.slider("Safety margin", 2, 15, 6, key="wf_safety_margin")
             crf = None
             content_tune, cap_peak_bitrate = "Auto", False
-
         else:
             pc1, pc2, pc3 = st.columns(3)
-
             with pc1:
-                codec = st.selectbox(
-                    "Codec",
-                    ["AVC (H.264)", "HEVC (H.265)", "AV1"],
-                    index=["AVC (H.264)", "HEVC (H.265)", "AV1"].index(profile["default_codec"]),
-                    key="wf_codec_crf",
-                )
-
+                codec = st.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"],
+                    index=["AVC (H.264)", "HEVC (H.265)", "AV1"].index(profile["default_codec"]), key="wf_codec_crf")
             if codec == "AV1":
-                default_crf = profile["av1"]["crf"]
-                default_preset = profile["av1"]["preset"]
-                preset_opts = ["4", "5", "6", "7", "8"]
-                st.info("AV1 output uses WebM (10-bit pipeline). Some environments may not preview AV1 WebM reliably.")
+                default_crf, default_preset, preset_opts = profile["av1"]["crf"], profile["av1"]["preset"], ["4", "5", "6", "7", "8"]
             elif codec == "HEVC (H.265)":
-                default_crf = profile["hevc"]["crf"]
-                default_preset = profile["hevc"]["preset"]
-                preset_opts = ["veryfast", "fast", "medium", "slow"]
+                default_crf, default_preset, preset_opts = profile["hevc"]["crf"], profile["hevc"]["preset"], ["veryfast", "fast", "medium", "slow"]
             else:
-                default_crf = profile["h264"]["crf"]
-                default_preset = profile["h264"]["preset"]
-                preset_opts = ["veryfast", "fast", "medium", "slow"]
-
-            with pc2:
-                crf = st.slider(
-                    "CRF override",
-                    14,
-                    45,
-                    int(default_crf),
-                    key="wf_crf",
-                    help="Lower = higher quality + larger file. Higher = smaller file + lower quality.",
-                )
-
+                default_crf, default_preset, preset_opts = profile["h264"]["crf"], profile["h264"]["preset"], ["veryfast", "fast", "medium", "slow"]
+            with pc2: crf = st.slider("CRF override", 14, 45, int(default_crf), key="wf_crf")
             with pc3:
-                try:
-                    preset_idx = preset_opts.index(str(default_preset))
-                except ValueError:
-                    preset_idx = 0
-
+                try: preset_idx = preset_opts.index(str(default_preset))
+                except ValueError: preset_idx = 0
                 preset = st.selectbox("Preset override", preset_opts, index=preset_idx, key="wf_preset_crf")
-
             tc_col1, tc_col2 = st.columns(2)
-            with tc_col1:
-                content_tune = st.selectbox(
-                    "Content tuning",
-                    ["Auto", "Film / live-action", "Animation", "Screen / UGC-graphics", "Grain-heavy"],
-                    index=0,
-                    key="wf_content_tune",
-                    help="Adjusts psy-RD / adaptive-quantization behavior per content type — the same "
-                         "idea behind Aurora/CAE 'scene-based optimization' presets, approximated with "
-                         "open x264/x265/SVT-AV1 tuning flags rather than a proprietary model.",
-                )
-            with tc_col2:
-                cap_peak_bitrate = st.checkbox(
-                    "Cap peak bitrate (streaming-safe)",
-                    value=False,
-                    key="wf_cap_peak",
-                    help="Adds -maxrate/-bufsize around the CRF estimate so a single complex scene can't "
-                         "spike the bitrate far past the average — recommended for anything going through "
-                         "a CDN/ABR pipeline with fixed peak-bandwidth budgets. For a stricter guarantee, "
-                         "see 'Strict Streaming' in Advanced Engine Tuning below.",
-                )
-
+            with tc_col1: content_tune = st.selectbox("Content tuning", ["Auto", "Film / live-action", "Animation", "Screen / UGC-graphics", "Grain-heavy"], index=0, key="wf_content_tune")
+            with tc_col2: cap_peak_bitrate = st.checkbox("Cap peak bitrate (streaming-safe)", value=False, key="wf_cap_peak")
             target_mb, target_audio_kbps = None, None
 
     st.markdown("<br>", unsafe_allow_html=True)
-
     st.markdown("<div class='section-title'>Step 3 · Enhancements</div>", unsafe_allow_html=True)
-
     with st.container(border=True):
         with st.expander("🛡️ Quality enhancement", expanded=True):
             e1, e2, e3 = st.columns(3)
             denoise = e1.checkbox("Denoise", value=False, key="wf_denoise")
             deblock = e2.checkbox("Deblock", value=False, key="wf_deblock")
             sharpen = e3.checkbox("Sharpen", value=False, key="wf_sharpen")
-
         with st.expander("🧠 Advanced Engine Tuning", expanded=False):
-            st.caption(
-                "Enterprise-grade psycho-visual and rate-control techniques inspired by Ateme/Visionular-class "
-                "encoders, layered on top of the codec's baked-in 10-bit + AQ/psy-RD tuning applied above."
-            )
             at1, at2, at3 = st.columns(3)
-
-            grain_removal = at1.checkbox(
-                "🎞️ Grain management",
-                value=False,
-                key="wf_grain",
-                help="x264/x265: strips grain with NLMeans (or hqdn3d fallback) before encoding, so bits "
-                     "aren't wasted compressing noise. SVT-AV1: skips the pre-filter and instead uses the "
-                     "encoder's native film-grain synthesis — encode clean, re-synthesize matching grain "
-                     "on playback via AV1 film-grain metadata.",
-            )
-            deband = at2.checkbox(
-                "🌈 Perceptual debanding",
-                value=False,
-                key="wf_deband",
-                help="Applies the `deband` filter pre-encode to remove gradient banding in dark scenes and "
-                     "skies — often a free VMAF win on 8-bit sources with smooth gradients.",
-            )
-            strict_vbv = at3.checkbox(
-                "📡 Strict Streaming (CDN-safe VBV)",
-                value=False,
-                key="wf_strict_vbv",
-                help="Enforces hard VBV/HRD bounds (nal-hrd=cbr on x264, hrd=1 on x265) with tight "
-                     "maxrate/bufsize so bitrate spikes can't blow through a fixed CDN/ABR peak-bandwidth "
-                     "budget. Recommended for anything served over HLS/DASH.",
-            )
-
+            grain_removal = at1.checkbox("🎞️ Grain management", value=False, key="wf_grain")
+            deband = at2.checkbox("🌈 Perceptual debanding", value=False, key="wf_deband")
+            strict_vbv = at3.checkbox("📡 Strict Streaming (CDN-safe VBV)", value=False, key="wf_strict_vbv")
         with st.expander("🎨 Color processing", expanded=False):
             c1, c2 = st.columns(2)
             color = c1.checkbox("Color boost", value=False, key="wf_color")
             is_hdr_src = detect_hdr(src_meta) if src_meta else False
-            hdr_sdr = c2.checkbox(
-                "HDR → SDR",
-                value=is_hdr_src,
-                disabled=not is_hdr_src,
-                key="wf_hdr_sdr",
-                help="Enabled only when HDR metadata is detected.",
-            )
-
+            hdr_sdr = c2.checkbox("HDR → SDR", value=is_hdr_src, disabled=not is_hdr_src, key="wf_hdr_sdr")
         with st.expander("🎞️ Motion processing", expanded=False):
             interp_recommended, _ = recommend_interpolation(src_meta) if src_meta else (True, "")
-            interp = st.checkbox(
-                "Frame interpolation → 60fps",
-                value=False,
-                disabled=not interp_recommended,
-                key="wf_interp",
-                help="Disabled when source is already ≥ 50 fps.",
-            )
-
+            interp = st.checkbox("Frame interpolation → 60fps", value=False, disabled=not interp_recommended, key="wf_interp")
         with st.expander("📐 Resolution", expanded=False):
-            scale_to = st.selectbox(
-                "Target resolution",
-                ["Source", "480p", "720p", "1080p", "2160p"],
-                index=0,
-                key="wf_scale_to",
-            )
-
+            scale_to = st.selectbox("Target resolution", ["Source", "480p", "720p", "1080p", "2160p"], index=0, key="wf_scale_to")
         with st.expander("🖼️ Image / logo overlay", expanded=False):
             if is_target_mode:
-                st.info("Watermark overlay is disabled in Target Size mode to keep two-pass output predictable.")
-                image_mode = "Ignore image"
-                logo_pos, logo_scale = "Top right", 14
+                st.info("Watermark overlay is disabled in Target Size mode.")
+                image_mode, logo_pos, logo_scale = "Ignore image", "Top right", 14
             else:
-                image_mode = st.selectbox(
-                    "Attached image behavior",
-                    ["Ignore image", "Watermark / logo overlay", "Poster only in player"],
-                    index=1 if st.session_state.img else 0,
-                    key="wf_image_mode",
-                )
-
+                image_mode = st.selectbox("Attached image behavior", ["Ignore image", "Watermark / logo overlay", "Poster only in player"], index=1 if st.session_state.img else 0, key="wf_image_mode")
                 lc1, lc2 = st.columns(2)
                 logo_pos = lc1.selectbox("Logo position", ["Top right", "Top left", "Bottom right", "Bottom left"], key="wf_logo_pos")
                 logo_scale = lc2.slider("Logo scale %", 5, 35, 14, key="wf_logo_scale")
-
         with st.expander("✅ Pre-encode QC gate", expanded=False):
-            st.caption(
-                "Runs the same container/video/audio QC probes as the QC tab against the source before "
-                "encoding starts. Uses a 60s quick scan (not the full file) to keep the gate fast."
-            )
             qgc1, qgc2 = st.columns(2)
-            qc_gate_enabled = qgc1.checkbox(
-                "🛡️ Require QC pass before encoding",
-                value=False,
-                key="wf_qc_gate",
-                help="If enabled, blocks the Encode button's run on a FAIL verdict unless the override below is checked.",
-            )
-            qc_gate_spec = qgc2.selectbox(
-                "Gate spec",
-                list(QC_SPECS.keys()),
-                index=0,
-                key="wf_qc_gate_spec",
-                disabled=not qc_gate_enabled,
-            )
-            qc_gate_override = st.checkbox(
-                "Override and encode anyway if QC fails",
-                value=False,
-                key="wf_qc_override",
-                disabled=not qc_gate_enabled,
-            )
+            qc_gate_enabled = qgc1.checkbox("🛡️ Require QC pass before encoding", value=False, key="wf_qc_gate")
+            qc_gate_spec = qgc2.selectbox("Gate spec", list(QC_SPECS.keys()), index=0, key="wf_qc_gate_spec", disabled=not qc_gate_enabled)
+            qc_gate_override = st.checkbox("Override and encode anyway if QC fails", value=False, key="wf_qc_override", disabled=not qc_gate_enabled)
 
-    enhancements = dict(
-        denoise=denoise,
-        sharpen=sharpen,
-        deblock=deblock,
-        color=color,
-        hdr_sdr=hdr_sdr,
-        interp=interp,
-        scale_to=scale_to,
-        grain_removal=grain_removal,
-        deband=deband,
-    )
-
+    enhancements = dict(denoise=denoise, sharpen=sharpen, deblock=deblock, color=color, hdr_sdr=hdr_sdr, interp=interp, scale_to=scale_to, grain_removal=grain_removal, deband=deband)
     if src_meta and not is_target_mode:
         risky = []
-        if interp:
-            risky.append("frame interpolation")
-        if scale_to in ["1080p", "2160p"]:
-            risky.append("upscaling")
-        if sharpen:
-            risky.append("sharpening")
-        if color:
-            risky.append("color boost")
-
+        if interp: risky.append("frame interpolation")
+        if scale_to in ["1080p", "2160p"]: risky.append("upscaling")
+        if sharpen: risky.append("sharpening")
+        if color: risky.append("color boost")
         if risky:
-            st.warning(
-                "Selected enhancements may increase file size because they add detail, pixels, frames, or visual complexity. "
-                "Use Guaranteed Target Size mode if output size must be controlled. "
-                f"Active: {', '.join(risky)}."
-            )
+            st.warning(f"Selected enhancements may increase file size. Active: {', '.join(risky)}.")
 
     st.markdown("<br>", unsafe_allow_html=True)
-
     st.markdown("<div class='section-title'>Step 4 · Preview Impact</div>", unsafe_allow_html=True)
-
     if src_meta:
         with st.container(border=True):
             if is_target_mode:
-                v_kbps = bitrate_from_target_size(
-                    src_meta.get("duration", 0),
-                    float(target_mb),
-                    int(target_audio_kbps),
-                )
-
+                v_kbps = bitrate_from_target_size(src_meta.get("duration", 0), float(target_mb), int(target_audio_kbps))
                 pc1, pc2, pc3, pc4 = st.columns(4)
-                with pc1:
-                    render_metric("Target Output Size", f"{target_mb:.1f} MB")
+                with pc1: render_metric("Target Output Size", f"{target_mb:.1f} MB")
                 with pc2:
+                    # [FIX-5] Explicit error messaging when target size is too small
                     render_metric(
                         "Computed Video Bitrate",
-                        f"{v_kbps} kbps" if v_kbps else "—",
-                        "Too small for duration" if not v_kbps else "",
+                        f"{v_kbps} kbps" if v_kbps > 0 else "ERROR",
+                        "Target size too small to cover audio + overhead" if v_kbps <= 0 else "",
                     )
-                with pc3:
-                    render_metric("Audio Bitrate", f"{target_audio_kbps} kbps")
-                with pc4:
-                    render_metric("Passes", "2")
-
+                with pc3: render_metric("Audio Bitrate", f"{target_audio_kbps} kbps")
+                with pc4: render_metric("Passes", "2")
             else:
                 est = estimate_output(src_meta, codec, int(crf), enhancements)
-
                 pc1, pc2, pc3, pc4 = st.columns(4)
-                with pc1:
-                    render_metric("Est. Output Size", f"{est['est_size_mb']:.2f} MB")
-                with pc2:
-                    render_metric("Est. Bitrate", f"{est['est_bitrate_kbps']} kbps")
-                with pc3:
-                    render_metric("Expected Savings", f"{est['expected_savings_pct']:.1f}%")
+                with pc1: render_metric("Est. Output Size", f"{est['est_size_mb']:.2f} MB")
+                with pc2: render_metric("Est. Bitrate", f"{est['est_bitrate_kbps']} kbps")
+                with pc3: render_metric("Expected Savings", f"{est['expected_savings_pct']:.1f}%")
                 with pc4:
                     m = est["est_time_sec"]
                     render_metric("Est. Encode Time", f"{m // 60}m {m % 60}s")
@@ -3279,560 +2444,224 @@ with tab_work:
         st.info("Upload a source video to see estimates.")
 
     st.markdown("<br>", unsafe_allow_html=True)
-
     st.markdown("<div class='section-title'>Step 5 · Encode</div>", unsafe_allow_html=True)
-
     with st.container(border=True):
         go = st.button("✨ Encode Now", type="primary", use_container_width=True)
-
         if go:
             if not st.session_state.src:
                 st.error("Upload a source video first.")
             else:
                 src_for_encode = Path(st.session_state.src)
                 proceed_with_encode = True
-
-                # ---- Pre-encode QC gate (V4.2) ----
                 if qc_gate_enabled:
                     gate_sid = uuid.uuid4().hex
-                    with st.spinner("Running pre-encode QC gate…"):
-                        gate_report = run_qc(
-                            src_for_encode, src_meta, qc_gate_spec, gate_sid,
-                            run_filters=True, sample_seconds=60.0,
-                        )
-
+                    # [FIX-7] Use st.status for live feedback during QC gate
+                    with st.status("Running pre-encode QC gate…", expanded=True) as status:
+                        st.write("Analyzing source file...")
+                        gate_report = run_qc(src_for_encode, src_meta, qc_gate_spec, gate_sid, run_filters=True, sample_seconds=60.0)
+                        status.update(label="QC gate complete!", state="complete" if gate_report["verdict"] != "FAIL" else "error", expanded=False)
                     if gate_report["verdict"] == "FAIL":
-                        st.error(
-                            f"❌ Pre-encode QC gate FAILED — {gate_report['n_fail']} failing check(s) "
-                            f"against spec '{qc_gate_spec}'."
-                        )
+                        st.error(f"❌ Pre-encode QC gate FAILED — {gate_report['n_fail']} failing check(s).")
                         fail_df = pd.DataFrame([c for c in gate_report["checks"] if c["status"] == "fail"])
                         if not fail_df.empty:
-                            st.dataframe(
-                                fail_df[["category", "check", "detail"]].rename(
-                                    columns={"category": "Category", "check": "Check", "detail": "Detail"}
-                                ),
-                                use_container_width=True, hide_index=True,
-                            )
-                        if qc_gate_override:
-                            st.warning("Override is enabled — proceeding with encode despite the QC failure.")
-                        else:
+                            st.dataframe(fail_df[["category", "check", "detail"]], use_container_width=True, hide_index=True)
+                        if not qc_gate_override:
                             proceed_with_encode = False
-                            st.info("Encode blocked. Check 'Override and encode anyway' above to bypass, or fix the source and re-run.")
                     elif gate_report["verdict"] == "WARNING":
-                        st.warning(f"⚠️ Pre-encode QC gate passed with {gate_report['n_warn']} warning(s) — proceeding with encode.")
-                        warn_df = pd.DataFrame([c for c in gate_report["checks"] if c["status"] == "warn"])
-                        if not warn_df.empty:
-                            with st.expander(f"⚠️ View {len(warn_df)} warning(s)", expanded=True):
-                                st.dataframe(
-                                    warn_df[["category", "check", "detail"]].rename(
-                                        columns={"category": "Category", "check": "Check", "detail": "Detail"}
-                                    ),
-                                    use_container_width=True, hide_index=True,
-                                )
+                        st.warning(f"⚠️ Pre-encode QC gate passed with {gate_report['n_warn']} warning(s).")
                     else:
                         st.success("✅ Pre-encode QC gate passed.")
-
                 if proceed_with_encode:
                     sid = uuid.uuid4().hex
                     src = src_for_encode
                     logo = Path(st.session_state.img) if st.session_state.img else None
                     bar = st.progress(0.0, text="Starting FFmpeg encode…")
-
                     if is_target_mode:
-                        opts = dict(
-                            codec=codec,
-                            preset=preset,
-                            target_mb=target_mb,
-                            audio_kbps=target_audio_kbps,
-                            safety_margin_pct=safety_margin_pct,
-                            denoise=denoise,
-                            sharpen=sharpen,
-                            deblock=deblock,
-                            color=color,
-                            hdr_sdr=hdr_sdr,
-                            interp=interp,
-                            scale_to=scale_to,
-                            grain_removal=grain_removal,
-                            deband=deband,
-                            strict_vbv=strict_vbv,
-                        )
-
-                        out_path, log, md = encode_two_pass(
-                            src,
-                            opts,
-                            src_meta,
-                            sid,
-                            cb=lambda p, t: bar.progress(float(p), text=t),
-                        )
-
+                        opts = dict(codec=codec, preset=preset, target_mb=target_mb, audio_kbps=target_audio_kbps, safety_margin_pct=safety_margin_pct, denoise=denoise, sharpen=sharpen, deblock=deblock, color=color, hdr_sdr=hdr_sdr, interp=interp, scale_to=scale_to, grain_removal=grain_removal, deband=deband, strict_vbv=strict_vbv)
+                        out_path, log, md = encode_two_pass(src, opts, src_meta, sid, cb=lambda p, t: bar.progress(float(p), text=t))
                     else:
-                        opts = dict(
-                            codec=codec,
-                            crf=crf,
-                            preset=preset,
-                            profile=profile_name,
-                            denoise=denoise,
-                            sharpen=sharpen,
-                            deblock=deblock,
-                            color=color,
-                            hdr_sdr=hdr_sdr,
-                            interp=interp,
-                            scale_to=scale_to,
-                            image_mode=image_mode,
-                            logo_pos=logo_pos,
-                            logo_scale=logo_scale,
-                            content_tune=content_tune,
-                            cap_peak_bitrate=cap_peak_bitrate,
-                            grain_removal=grain_removal,
-                            deband=deband,
-                            strict_vbv=strict_vbv,
-                        )
-
-                        out_path, log, md = encode_video(
-                            src,
-                            logo,
-                            opts,
-                            src_meta,
-                            sid,
-                            cb=lambda p, t: bar.progress(float(p), text=t),
-                        )
-
+                        opts = dict(codec=codec, crf=crf, preset=preset, profile=profile_name, denoise=denoise, sharpen=sharpen, deblock=deblock, color=color, hdr_sdr=hdr_sdr, interp=interp, scale_to=scale_to, image_mode=image_mode, logo_pos=logo_pos, logo_scale=logo_scale, content_tune=content_tune, cap_peak_bitrate=cap_peak_bitrate, grain_removal=grain_removal, deband=deband, strict_vbv=strict_vbv)
+                        out_path, log, md = encode_video(src, logo, opts, src_meta, sid, cb=lambda p, t: bar.progress(float(p), text=t))
                     if not out_path:
                         st.error(md.get("error", "Encoding failed"))
-                        if md.get("tail"):
-                            st.code(md["tail"])
+                        if md.get("tail"): st.code(md["tail"])
                     else:
                         st.session_state.out = str(out_path)
                         st.session_state.last_md = md
                         st.session_state.last_log = str(log)
-
-                        if md.get("warning"):
-                            st.warning(md["warning"])
-
+                        if md.get("warning"): st.warning(md["warning"])
                         if is_target_mode:
                             actual_mb = out_path.stat().st_size / 1048576
                             if actual_mb > target_mb:
-                                st.warning(
-                                    f"⚠️ Output landed at {actual_mb:.2f} MB, over the {target_mb:.1f} MB target "
-                                    f"despite the safety margin. Try raising the safety margin or lowering the "
-                                    f"target further."
-                                )
-
+                                st.warning(f"⚠️ Output landed at {actual_mb:.2f} MB, over the {target_mb:.1f} MB target.")
                         with st.spinner("Computing quality metrics…"):
                             q = quality_metrics(src, out_path, sid, quick=True)
-
                         st.session_state.last_metrics = q
-
                         sm = src_meta
                         dm = media(out_path)
                         saved = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
-
-                        row = {
-                            "timestamp": datetime.now().isoformat(timespec="seconds"),
-                            "source": src.name,
-                            "output": out_path.name,
-                            "mode": "Two-pass Target Size" if is_target_mode else "Standard CRF",
-                            "profile": profile_name,
-                            "codec": codec,
-                            "actual_encoder": md.get("actual_encoder", ""),
-                            "crf": crf if crf is not None else "",
-                            "preset": preset,
-                            "target_mb": target_mb if is_target_mode else "",
-                            "source_mb": round(sm["size_mb"], 3),
-                            "output_mb": round(dm["size_mb"], 3),
-                            "saved_pct": round(saved, 2),
-                            "grain_removal": grain_removal,
-                            "deband": deband,
-                            "strict_vbv": strict_vbv,
-                            "PSNR": q.get("PSNR"),
-                            "SSIM": q.get("SSIM"),
-                            "VMAF": q.get("VMAF"),
-                            "VMAF_proxy": q.get("VMAF_proxy"),
-                            "log": str(log),
-                        }
-
+                        row = {"timestamp": datetime.now().isoformat(timespec="seconds"), "source": src.name, "output": out_path.name, "mode": "Two-pass Target Size" if is_target_mode else "Standard CRF", "profile": profile_name, "codec": codec, "actual_encoder": md.get("actual_encoder", ""), "crf": crf if crf is not None else "", "preset": preset, "target_mb": target_mb if is_target_mode else "", "source_mb": round(sm["size_mb"], 3), "output_mb": round(dm["size_mb"], 3), "saved_pct": round(saved, 2), "grain_removal": grain_removal, "deband": deband, "strict_vbv": strict_vbv, "PSNR": q.get("PSNR"), "SSIM": q.get("SSIM"), "VMAF": q.get("VMAF"), "VMAF_proxy": q.get("VMAF_proxy"), "log": str(log)}
                         csvrow(row)
-
                         toast(f"Encode complete · {dm['size_mb']:.2f} MB")
-                        st.success(
-                            f"Done · {dm['size_mb']:.2f} MB · saved {saved:.1f}% · encoder {md.get('actual_encoder', 'unknown')}"
-                        )
-
-                        st.download_button(
-                            "⬇ Download Output",
-                            out_path.read_bytes(),
-                            out_path.name,
-                            md.get("mime", "application/octet-stream"),
-                        )
-
+                        st.success(f"Done · {dm['size_mb']:.2f} MB · saved {saved:.1f}% · encoder {md.get('actual_encoder', 'unknown')}")
+                        st.download_button("⬇ Download Output", out_path.read_bytes(), out_path.name, md.get("mime", "application/octet-stream"))
     st.markdown("<br>", unsafe_allow_html=True)
-
 
 # ============================================================
 # Batch tab
 # ============================================================
-
 with tab_batch:
     st.markdown("<div class='section-title'>Batch Encoding</div>", unsafe_allow_html=True)
-    st.caption("Upload multiple files, pick a shared profile/codec, and process them sequentially with a master progress bar.")
-
     with st.container(border=True):
-        batch_files = st.file_uploader(
-            "Upload multiple source videos",
-            type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"],
-            accept_multiple_files=True,
-            key="batch_upload",
-        )
-
+        batch_files = st.file_uploader("Upload multiple source videos", type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"], accept_multiple_files=True, key="batch_upload")
         bc1, bc2, bc3 = st.columns(3)
-
-        batch_profile = bc1.selectbox(
-            "Profile",
-            [k for k in PROFILES if k != TARGET_PROFILE],
-            index=1,
-            key="batch_profile",
-        )
+        batch_profile = bc1.selectbox("Profile", [k for k in PROFILES if k != TARGET_PROFILE], index=1, key="batch_profile")
         batch_codec = bc2.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], key="batch_codec")
         batch_preset = bc3.selectbox("Preset", ["veryfast", "fast", "medium", "slow"], index=1, key="batch_preset")
-
         bprof = PROFILES[batch_profile]
-        _crf_lookup = {
-            "AVC (H.264)": bprof["h264"]["crf"],
-            "HEVC (H.265)": bprof["hevc"]["crf"],
-            "AV1": bprof["av1"]["crf"],
-        }
+        _crf_lookup = {"AVC (H.264)": bprof["h264"]["crf"], "HEVC (H.265)": bprof["hevc"]["crf"], "AV1": bprof["av1"]["crf"]}
         batch_crf = st.slider("CRF", 14, 45, int(_crf_lookup[batch_codec]), key="batch_crf")
-
         bt1, bt2, bt3 = st.columns(3)
         batch_grain = bt1.checkbox("Grain management", value=False, key="batch_grain")
         batch_deband = bt2.checkbox("Debanding", value=False, key="batch_deband")
         batch_strict = bt3.checkbox("Strict VBV", value=False, key="batch_strict")
-
-        if batch_files:
-            st.caption(f"{len(batch_files)} file(s) queued: " + ", ".join(f.name for f in batch_files))
-
         if st.button("🚀 Run Batch Encode", type="primary", use_container_width=True):
-            if not batch_files:
-                st.error("Upload at least one file.")
+            if not batch_files: st.error("Upload at least one file.")
             else:
-                results = []
-                out_paths: List[Path] = []
+                results, out_paths = [], []
                 n = len(batch_files)
                 master_bar = st.progress(0.0, text="Starting batch…")
-
                 for i, bf in enumerate(batch_files):
                     sid = uuid.uuid4().hex
-
                     try:
                         sp = save_upload(bf, IN_DIR)
                         sm = media(sp)
-
-                        opts = dict(
-                            codec=batch_codec,
-                            crf=batch_crf,
-                            preset=batch_preset,
-                            profile=batch_profile,
-                            denoise=False,
-                            sharpen=False,
-                            deblock=False,
-                            color=False,
-                            hdr_sdr=False,
-                            interp=False,
-                            scale_to="Source",
-                            image_mode="Ignore image",
-                            logo_pos="Top right",
-                            logo_scale=14,
-                            content_tune="Auto",
-                            cap_peak_bitrate=False,
-                            grain_removal=batch_grain,
-                            deband=batch_deband,
-                            strict_vbv=batch_strict,
-                        )
-
+                        opts = dict(codec=batch_codec, crf=batch_crf, preset=batch_preset, profile=batch_profile, denoise=False, sharpen=False, deblock=False, color=False, hdr_sdr=False, interp=False, scale_to="Source", image_mode="Ignore image", logo_pos="Top right", logo_scale=14, content_tune="Auto", cap_peak_bitrate=False, grain_removal=batch_grain, deband=batch_deband, strict_vbv=batch_strict)
                         def _cb(p, t, i=i, n=n, name=bf.name):
-                            master_bar.progress(min(0.999, (i + p) / n), text=f"[{i + 1}/{n}] {name} · {t}")
-
+                            master_bar.progress(min(0.999, (i + p) / n), text=f"[{i+1}/{n}] {name} · {t}")
                         out_p, log, md = encode_video(sp, None, opts, sm, sid, cb=_cb)
-
                         if out_p:
                             dm = media(out_p)
                             saved = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
-                            results.append({
-                                "File": bf.name,
-                                "Output": out_p.name,
-                                "Size MB": round(dm["size_mb"], 2),
-                                "Saved %": round(saved, 1),
-                                "Encoder": md.get("actual_encoder", ""),
-                                "Status": "✅ Done",
-                            })
+                            results.append({"File": bf.name, "Output": out_p.name, "Size MB": round(dm["size_mb"], 2), "Saved %": round(saved, 1), "Encoder": md.get("actual_encoder", ""), "Status": "✅ Done"})
                             out_paths.append(out_p)
                         else:
-                            results.append({
-                                "File": bf.name,
-                                "Output": "—",
-                                "Size MB": None,
-                                "Saved %": None,
-                                "Encoder": "",
-                                "Status": f"❌ {md.get('error', 'Failed')}",
-                            })
+                            results.append({"File": bf.name, "Output": "—", "Size MB": None, "Saved %": None, "Encoder": "", "Status": f"❌ {md.get('error', 'Failed')}"})
                     except Exception as e:
-                        results.append({
-                            "File": bf.name,
-                            "Output": "—",
-                            "Size MB": None,
-                            "Saved %": None,
-                            "Encoder": "",
-                            "Status": f"❌ {e}",
-                        })
-
+                        results.append({"File": bf.name, "Output": "—", "Size MB": None, "Saved %": None, "Encoder": "", "Status": f"❌ {e}"})
                 master_bar.progress(1.0, text="Batch complete")
-
-                if results:
-                    st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-
+                if results: st.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
                 if out_paths:
                     zp = OUT_DIR / f"batch_{int(time.time())}.zip"
                     with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-                        for op in out_paths:
-                            z.write(op, op.name)
-
-                    st.download_button(
-                        "⬇ Download All Outputs (ZIP)",
-                        zp.read_bytes(),
-                        zp.name,
-                        "application/zip",
-                    )
-
+                        for op in out_paths: z.write(op, op.name)
+                    st.download_button("⬇ Download All Outputs (ZIP)", zp.read_bytes(), zp.name, "application/zip")
 
 # ============================================================
 # Compare tab
 # ============================================================
-
 with tab_compare:
     if not (st.session_state.src and st.session_state.out and Path(st.session_state.out).exists()):
         st.info("Run an encode first to see the comparison dashboard.")
     else:
         src = Path(st.session_state.src)
         out = Path(st.session_state.out)
-
-        sm = media(src)
-        dm = media(out)
+        sm, dm = media(src), media(out)
         q = st.session_state.last_metrics or {}
-
         saved_pct = (1 - dm["size_mb"] / sm["size_mb"]) * 100 if sm["size_mb"] else 0
         br_save = (1 - dm["bitrate_kbps"] / sm["bitrate_kbps"]) * 100 if sm["bitrate_kbps"] else 0
-
         st.markdown("<div class='section-title'>Input vs Output</div>", unsafe_allow_html=True)
-
         cc1, cc2, cc3 = st.columns([1, 1, 1])
-
         with cc1:
-            st.markdown(
-                f"""
-                <div class='compare-input'>
-                    <div style='font-weight:800;font-size:1rem;margin-bottom:10px;color:#475569'>📥 INPUT</div>
-                    <div class='compare-row'><span class='compare-label'>Size</span><span class='compare-val'>{sm['size_mb']:.2f} MB</span></div>
-                    <div class='compare-row'><span class='compare-label'>Codec</span><span class='compare-val'>{sm['vcodec'].upper()}</span></div>
-                    <div class='compare-row'><span class='compare-label'>Bitrate</span><span class='compare-val'>{sm['bitrate_kbps']:.0f} kbps</span></div>
-                    <div class='compare-row'><span class='compare-label'>Resolution</span><span class='compare-val'>{sm['width']}×{sm['height']}</span></div>
-                    <div class='compare-row'><span class='compare-label'>FPS</span><span class='compare-val'>{sm['fps']:.2f}</span></div>
-                    <div class='compare-row'><span class='compare-label'>Duration</span><span class='compare-val'>{sm['duration']:.1f}s</span></div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
+            st.markdown(f"<div class='compare-input'><div style='font-weight:800;font-size:1rem;margin-bottom:10px;color:#475569'>📥 INPUT</div><div class='compare-row'><span class='compare-label'>Size</span><span class='compare-val'>{sm['size_mb']:.2f} MB</span></div><div class='compare-row'><span class='compare-label'>Codec</span><span class='compare-val'>{sm['vcodec'].upper()}</span></div><div class='compare-row'><span class='compare-label'>Bitrate</span><span class='compare-val'>{sm['bitrate_kbps']:.0f} kbps</span></div><div class='compare-row'><span class='compare-label'>Resolution</span><span class='compare-val'>{sm['width']}×{sm['height']}</span></div><div class='compare-row'><span class='compare-label'>FPS</span><span class='compare-val'>{sm['fps']:.2f}</span></div><div class='compare-row'><span class='compare-label'>Duration</span><span class='compare-val'>{sm['duration']:.1f}s</span></div></div>", unsafe_allow_html=True)
         with cc2:
-            st.markdown(
-                f"""
-                <div class='savings-card'>
-                    <div class='savings-value'>{saved_pct:+.1f}%</div>
-                    <div class='savings-label'>Size Reduction</div>
-                    <div style='margin-top:12px;font-size:.85rem;opacity:.95'>Bitrate {br_save:+.1f}%</div>
-                    <div style='margin-top:6px;font-size:.85rem;opacity:.95'>Saved {(sm['size_mb'] - dm['size_mb']):.2f} MB</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
+            st.markdown(f"<div class='savings-card'><div class='savings-value'>{saved_pct:+.1f}%</div><div class='savings-label'>Size Reduction</div><div style='margin-top:12px;font-size:.85rem;opacity:.95'>Bitrate {br_save:+.1f}%</div><div style='margin-top:6px;font-size:.85rem;opacity:.95'>Saved {(sm['size_mb'] - dm['size_mb']):.2f} MB</div></div>", unsafe_allow_html=True)
         with cc3:
-            st.markdown(
-                f"""
-                <div class='compare-output'>
-                    <div style='font-weight:800;font-size:1rem;margin-bottom:10px;color:#1e3a8a'>📤 OUTPUT</div>
-                    <div class='compare-row'><span class='compare-label'>Size</span><span class='compare-val'>{dm['size_mb']:.2f} MB</span></div>
-                    <div class='compare-row'><span class='compare-label'>Codec</span><span class='compare-val'>{dm['vcodec'].upper()}</span></div>
-                    <div class='compare-row'><span class='compare-label'>Bitrate</span><span class='compare-val'>{dm['bitrate_kbps']:.0f} kbps</span></div>
-                    <div class='compare-row'><span class='compare-label'>Resolution</span><span class='compare-val'>{dm['width']}×{dm['height']}</span></div>
-                    <div class='compare-row'><span class='compare-label'>FPS</span><span class='compare-val'>{dm['fps']:.2f}</span></div>
-                    <div class='compare-row'><span class='compare-label'>Duration</span><span class='compare-val'>{dm['duration']:.1f}s</span></div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
+            st.markdown(f"<div class='compare-output'><div style='font-weight:800;font-size:1rem;margin-bottom:10px;color:#1e3a8a'>📤 OUTPUT</div><div class='compare-row'><span class='compare-label'>Size</span><span class='compare-val'>{dm['size_mb']:.2f} MB</span></div><div class='compare-row'><span class='compare-label'>Codec</span><span class='compare-val'>{dm['vcodec'].upper()}</span></div><div class='compare-row'><span class='compare-label'>Bitrate</span><span class='compare-val'>{dm['bitrate_kbps']:.0f} kbps</span></div><div class='compare-row'><span class='compare-label'>Resolution</span><span class='compare-val'>{dm['width']}×{dm['height']}</span></div><div class='compare-row'><span class='compare-label'>FPS</span><span class='compare-val'>{dm['fps']:.2f}</span></div><div class='compare-row'><span class='compare-label'>Duration</span><span class='compare-val'>{dm['duration']:.1f}s</span></div></div>", unsafe_allow_html=True)
         st.markdown("<div class='section-title'>Quality Dashboard</div>", unsafe_allow_html=True)
-
         with st.container(border=True):
             q1, q2, q3, q4 = st.columns(4)
-
             with q1:
                 vmaf_val = q.get("VMAF", q.get("VMAF_proxy"))
-                render_metric(
-                    "VMAF",
-                    f"{vmaf_val:.2f}" if vmaf_val else "—",
-                    "True VMAF" if q.get("VMAF") else "Proxy from SSIM",
-                )
-
-            with q2:
-                render_metric(
-                    "SSIM",
-                    f"{q.get('SSIM', 0):.4f}" if q.get("SSIM") else "—",
-                    "0.95+ Good · 0.98+ Excellent",
-                )
-
-            with q3:
-                render_metric(
-                    "PSNR",
-                    f"{q.get('PSNR', 0):.2f} dB" if q.get("PSNR") else "—",
-                    "40+ dB Good",
-                )
-
+                render_metric("VMAF", f"{vmaf_val:.2f}" if vmaf_val else "—", "True VMAF" if q.get("VMAF") else "Proxy from SSIM")
+            with q2: render_metric("SSIM", f"{q.get('SSIM', 0):.4f}" if q.get("SSIM") else "—", "0.95+ Good · 0.98+ Excellent")
+            with q3: render_metric("PSNR", f"{q.get('PSNR', 0):.2f} dB" if q.get("PSNR") else "—", "40+ dB Good")
             with q4:
                 ratio = sm["size_mb"] / dm["size_mb"] if dm["size_mb"] else 0
                 render_metric("Compression Ratio", f"{ratio:.2f}×", "Size reduction factor")
-
         st.markdown("<div class='section-title'>Side-by-Side Playback</div>", unsafe_allow_html=True)
-
         sbs1, sbs2 = st.columns(2)
         poster = Path(st.session_state.img) if st.session_state.img and Path(st.session_state.img).exists() else None
-
         with sbs1:
             st.markdown("**Original**")
             player(src, poster, "video/mp4")
-
         with sbs2:
             st.markdown("**Encoded**")
-            mime_out = "video/webm" if out.suffix.lower() == ".webm" else "video/mp4"
-            player(out, poster, mime_out)
-
+            player(out, poster, "video/webm" if out.suffix.lower() == ".webm" else "video/mp4")
         if st.session_state.last_md:
-            st.download_button(
-                "⬇ Download Encoded Video",
-                out.read_bytes(),
-                out.name,
-                st.session_state.last_md.get("mime", "application/octet-stream"),
-            )
-
+            st.download_button("⬇ Download Encoded Video", out.read_bytes(), out.name, st.session_state.last_md.get("mime", "application/octet-stream"))
 
 # ============================================================
 # Player tab
 # ============================================================
-
 with tab_player:
     st.markdown("<div class='section-title'>Universal Player</div>", unsafe_allow_html=True)
-
     p = None
-
     if st.session_state.out and Path(st.session_state.out).exists():
         p = Path(st.session_state.out)
         st.caption(f"Loaded latest output: {p.name}")
     else:
         up_p = st.file_uploader("Upload media", type=["mp4", "webm", "mov", "mkv"], key="play_up")
-        if up_p:
-            p = save_upload(up_p, IN_DIR)
-
+        if up_p: p = save_upload(up_p, IN_DIR)
     if p:
         poster = Path(st.session_state.img) if st.session_state.img and Path(st.session_state.img).exists() else None
         mime = "video/webm" if p.suffix.lower() == ".webm" else "video/mp4"
         player(p, poster, mime)
-
     with st.expander("🎥 Experimental: WebRTC Camera Preview", expanded=False):
-        st.caption("WebRTC may fail on free cloud runtimes. It is only used for live camera preview, not playback.")
-
         if WEBRTC_AVAILABLE:
             enable = st.checkbox("Enable camera preview", value=False)
-
             if enable:
                 try:
-                    webrtc_streamer(
-                        key="webrtc-v4",
-                        rtc_configuration=RTCConfiguration(
-                            {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-                        ),
-                        media_stream_constraints={"video": True, "audio": False},
-                        async_processing=True,
-                    )
-                except Exception as e:
-                    st.warning(f"WebRTC failed: {e}")
-        else:
-            st.warning("streamlit-webrtc is not installed.")
-
+                    webrtc_streamer(key="webrtc-v4", rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}), media_stream_constraints={"video": True, "audio": False}, async_processing=True)
+                except Exception as e: st.warning(f"WebRTC failed: {e}")
+        else: st.warning("streamlit-webrtc is not installed.")
 
 # ============================================================
 # Quality tab
 # ============================================================
-
 with tab_quality:
     st.markdown("<div class='section-title'>Quality Analytics</div>", unsafe_allow_html=True)
-
     with st.container(border=True):
         qa, qb = st.columns(2)
-
         rf = qa.file_uploader("Reference / source", type=["mp4", "mov", "mkv", "webm"], key="ref_up")
         df_file = qb.file_uploader("Distorted / encoded", type=["mp4", "mov", "mkv", "webm"], key="dist_up")
-
         full = st.checkbox("Full duration", value=False)
-        use_temporal_pooling = st.checkbox(
-            "Also compute harmonic-mean pooled VMAF",
-            value=False,
-            help="Runs an extra libvmaf pass with pool=harmonic_mean, which penalizes low-scoring "
-                 "frames/segments much more heavily than the standard arithmetic-mean VMAF — useful "
-                 "for catching brief quality dips an average would smooth over. Requires libvmaf.",
-        )
-
+        use_temporal_pooling = st.checkbox("Also compute harmonic-mean pooled VMAF", value=False)
         if st.button("Calculate PSNR / SSIM / VMAF", use_container_width=True):
-            if not rf or not df_file:
-                st.error("Upload both files.")
+            if not rf or not df_file: st.error("Upload both files.")
             else:
                 sid = uuid.uuid4().hex
-                rp = save_upload(rf, IN_DIR)
-                dp = save_upload(df_file, IN_DIR)
-
-                with st.spinner("Computing metrics…"):
+                rp, dp = save_upload(rf, IN_DIR), save_upload(df_file, IN_DIR)
+                with st.status("Computing metrics…", expanded=True) as status:
+                    st.write("Running FFmpeg analysis...")
                     qm = quality_metrics(rp, dp, sid, quick=not full, temporal_pooling=use_temporal_pooling)
-
+                    status.update(label="Metrics complete!", state="complete", expanded=False)
                 q1, q2, q3, q4 = st.columns(4)
-
-                with q1:
-                    render_metric("PSNR", f"{qm.get('PSNR', 0):.2f} dB" if qm.get("PSNR") else "—")
-
-                with q2:
-                    render_metric("SSIM", f"{qm.get('SSIM', 0):.4f}" if qm.get("SSIM") else "—")
-
+                with q1: render_metric("PSNR", f"{qm.get('PSNR', 0):.2f} dB" if qm.get("PSNR") else "—")
+                with q2: render_metric("SSIM", f"{qm.get('SSIM', 0):.4f}" if qm.get("SSIM") else "—")
                 with q3:
                     v = qm.get("VMAF", qm.get("VMAF_proxy"))
                     render_metric("VMAF", f"{v:.2f}" if v else "—", "True VMAF" if qm.get("VMAF") else "Proxy")
-
                 with q4:
                     vh = qm.get("VMAF_harmonic")
-                    render_metric(
-                        "VMAF (harmonic)",
-                        f"{vh:.2f}" if vh is not None else "—",
-                        "Penalizes quality dips" if vh is not None else ("Enable checkbox above" if not qm.get("VMAF") else ""),
-                    )
-
+                    render_metric("VMAF (harmonic)", f"{vh:.2f}" if vh is not None else "—", "Penalizes quality dips" if vh is not None else "")
 
 # ============================================================
 # CRF Sweep tab
 # ============================================================
-
 with tab_sweep:
     st.markdown("<div class='section-title'>Rate-Distortion Sweep</div>", unsafe_allow_html=True)
-
     src_path = st.session_state.src
-
     with st.container(border=True):
         if not src_path:
             su = st.file_uploader("Upload source for sweep", type=["mp4", "mov", "mkv", "webm"], key="sweep_up")
@@ -3841,537 +2670,218 @@ with tab_sweep:
                 st.session_state.src = str(sp)
                 st.session_state.src_meta = media(sp)
                 src_path = str(sp)
-
         sw1, sw2, sw3, sw4 = st.columns(4)
-
         sw_codec = sw1.selectbox("Codec", ["AVC (H.264)", "HEVC (H.265)", "AV1"], key="sweep_codec_v4")
-        sw_profile = sw2.selectbox(
-            "Profile",
-            [k for k in PROFILES if k != TARGET_PROFILE],
-            index=1,
-            key="sweep_profile_v4",
-        )
+        sw_profile = sw2.selectbox("Profile", [k for k in PROFILES if k != TARGET_PROFILE], index=1, key="sweep_profile_v4")
         sw_start = sw3.number_input("CRF start", 14, 45, 22, key="sweep_start_v4")
         sw_end = sw4.number_input("CRF end", int(sw_start) + 1, 51, 38, key="sweep_end_v4")
         sw_step = st.slider("Step", 1, 10, 4, key="sweep_step_v4")
-
-        sweep_sample = st.selectbox(
-            "Sweep sample duration",
-            ["30", "60", "120", "Full"],
-            index=1,
-            help="Each CRF step encodes only this many seconds of the source (from the start), and quality metrics are computed over the same window — keeps sweeps fast on long clips. Choose Full to encode and measure the entire source.",
-        )
+        sweep_sample = st.selectbox("Sweep sample duration", ["30", "60", "120", "Full"], index=1)
         trim_val: Optional[float] = None if sweep_sample == "Full" else float(sweep_sample)
-
-        st.info(
-            "Sweep uses the existing encoder path. For very long files, use 30s or 60s sampling to avoid heavy cloud workloads."
-        )
-
         if st.button("🚀 Run CRF Sweep", type="primary"):
-            if not src_path:
-                st.error("Upload a source first.")
+            if not src_path: st.error("Upload a source first.")
             else:
                 src = Path(src_path)
                 sm = media(src)
                 crfs = list(range(int(sw_start), int(sw_end) + 1, int(sw_step)))
                 rows = []
                 prog = st.progress(0, text="Starting sweep…")
-
                 for i, cval in enumerate(crfs):
                     sid = uuid.uuid4().hex
-
-                    opts = dict(
-                        codec=sw_codec,
-                        crf=cval,
-                        preset="fast" if sw_codec != "AV1" else "6",
-                        profile=sw_profile,
-                        denoise=False,
-                        sharpen=False,
-                        deblock=False,
-                        color=False,
-                        hdr_sdr=False,
-                        interp=False,
-                        scale_to="Source",
-                        image_mode="Ignore image",
-                        logo_pos="Top right",
-                        logo_scale=14,
-                    )
-
-                    out_p, log, md = encode_video(
-                        src,
-                        None,
-                        opts,
-                        sm,
-                        sid,
-                        cb=lambda p, t, i=i: prog.progress(
-                            min(0.99, (i + p) / len(crfs)),
-                            text=f"CRF {cval} · {t}",
-                        ),
-                        trim_seconds=trim_val,
-                    )
-
+                    opts = dict(codec=sw_codec, crf=cval, preset="fast" if sw_codec != "AV1" else "6", profile=sw_profile, denoise=False, sharpen=False, deblock=False, color=False, hdr_sdr=False, interp=False, scale_to="Source", image_mode="Ignore image", logo_pos="Top right", logo_scale=14)
+                    out_p, log, md = encode_video(src, None, opts, sm, sid, cb=lambda p, t, i=i: prog.progress(min(0.99, (i + p) / len(crfs)), text=f"CRF {cval} · {t}"), trim_seconds=trim_val)
                     if out_p:
-                        qm = quality_metrics(
-                            src, out_p, sid,
-                            quick=(trim_val is not None),
-                            limit_sec=trim_val,
-                        )
+                        qm = quality_metrics(src, out_p, sid, quick=(trim_val is not None), limit_sec=trim_val)
                         dm = media(out_p)
-
-                        rows.append({
-                            "CRF": cval,
-                            "Size MB": round(dm["size_mb"], 2),
-                            "Bitrate kbps": round(dm["bitrate_kbps"]),
-                            "PSNR": qm.get("PSNR"),
-                            "SSIM": qm.get("SSIM"),
-                            "VMAF": qm.get("VMAF", qm.get("VMAF_proxy")),
-                            "Encoder": md.get("actual_encoder", ""),
-                            "File": out_p.name,
-                        })
-
+                        rows.append({"CRF": cval, "Size MB": round(dm["size_mb"], 2), "Bitrate kbps": round(dm["bitrate_kbps"]), "PSNR": qm.get("PSNR"), "SSIM": qm.get("SSIM"), "VMAF": qm.get("VMAF", qm.get("VMAF_proxy")), "Encoder": md.get("actual_encoder", ""), "File": out_p.name})
                 prog.progress(1.0, text="Sweep complete")
-
                 if rows:
                     df = pd.DataFrame(rows)
                     st.dataframe(df, use_container_width=True)
-
                     chart_cols = [c for c in ["Size MB", "VMAF", "SSIM"] if c in df.columns and df[c].notna().any()]
-                    if chart_cols:
-                        st.line_chart(df.set_index("CRF")[chart_cols])
-
-                    # ---- VMAF knee (diminishing-returns) detection ----
-                    # For each consecutive pair of sweep points we effectively have the
-                    # marginal quality gained per extra MB spent (dVMAF/dSize). Rather than
-                    # pick an arbitrary slope threshold, we find the point of maximum
-                    # perpendicular distance from the line connecting the cheapest/lowest-
-                    # quality point to the most expensive/highest-quality point — the
-                    # standard "elbow" construction — which identifies where a further
-                    # bitrate increase buys the least additional VMAF per MB.
+                    if chart_cols: st.line_chart(df.set_index("CRF")[chart_cols])
                     knee_row = None
                     dknee = df.dropna(subset=["VMAF", "Size MB"]).sort_values("CRF").reset_index(drop=True)
-
                     if len(dknee) >= 3:
                         x = dknee["Size MB"].to_numpy(dtype=float)
                         y = dknee["VMAF"].to_numpy(dtype=float)
-
                         with np.errstate(divide="ignore", invalid="ignore"):
                             marginal_vmaf_per_mb = np.diff(y) / np.diff(x)
-
-                        x_range = x.max() - x.min()
-                        y_range = y.max() - y.min()
-
+                        x_range, y_range = x.max() - x.min(), y.max() - y.min()
                         if x_range > 1e-9 and y_range > 1e-9:
-                            xn = (x - x.min()) / x_range
-                            yn = (y - y.min()) / y_range
-
+                            xn, yn = (x - x.min()) / x_range, (y - y.min()) / y_range
                             x1, y1, x2, y2 = xn[0], yn[0], xn[-1], yn[-1]
                             num = np.abs((y2 - y1) * xn - (x2 - x1) * yn + x2 * y1 - y2 * x1)
                             den = np.sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2) + 1e-9
-                            dist = num / den
-
-                            knee_idx = int(np.argmax(dist))
+                            knee_idx = int(np.argmax(num / den))
                             knee_row = dknee.iloc[knee_idx]
-
                     if knee_row is not None:
-                        st.markdown(
-                            f"<div class='ok-strip'>🦵 <b>Mathematically optimal CRF ≈ {int(knee_row['CRF'])}</b> "
-                            f"— {knee_row['Size MB']:.2f} MB at VMAF {knee_row['VMAF']:.1f}. "
-                            f"This is the knee of the rate-distortion curve for this specific video: below this "
-                            f"CRF you're spending disproportionately more bits for diminishing VMAF gains; above "
-                            f"it, quality starts dropping faster than size savings justify.</div>",
-                            unsafe_allow_html=True,
-                        )
-                    elif len(dknee) < 3:
-                        st.caption("ℹ️ Knee detection needs at least 3 CRF points with measured VMAF — widen the sweep range or reduce the step to enable it.")
-
-                    st.download_button(
-                        "⬇ Download CSV",
-                        df.to_csv(index=False).encode(),
-                        "crf_sweep.csv",
-                        "text/csv",
-                    )
-
+                        st.markdown(f"<div class='ok-strip'>🦵 <b>Mathematically optimal CRF ≈ {int(knee_row['CRF'])}</b> — {knee_row['Size MB']:.2f} MB at VMAF {knee_row['VMAF']:.1f}.</div>", unsafe_allow_html=True)
+                    st.download_button("⬇ Download CSV", df.to_csv(index=False).encode(), "crf_sweep.csv", "text/csv")
 
 # ============================================================
 # ABR tab
 # ============================================================
-
 with tab_abr:
     st.markdown("<div class='section-title'>Adaptive Bitrate Ladder / HLS / DASH</div>", unsafe_allow_html=True)
-
     src_abr = None
-
     with st.container(border=True):
         if st.session_state.out and Path(st.session_state.out).exists():
             src_abr = Path(st.session_state.out)
             st.caption(f"Using latest output: {src_abr.name}")
         else:
             au = st.file_uploader("Upload for ABR", type=["mp4", "mov", "mkv", "webm"], key="abr_up")
-            if au:
-                src_abr = save_upload(au, IN_DIR)
-
-        # CHANGED (V4.1): packaging format selector + configurable audio bitrate.
-        st.markdown("<div class='section-title' style='margin-top:8px'>Packaging format</div>", unsafe_allow_html=True)
-
+            if au: src_abr = save_upload(au, IN_DIR)
         fmt1, fmt2 = st.columns(2)
-        abr_format = fmt1.radio(
-            "Format",
-            ["📡 HLS", "🎬 DASH", "🎁 Both"],
-            horizontal=True,
-            key="abr_format",
-            help="DASH requires an ffmpeg build with the `dash` muxer — check the DASH badge in the header. "
-                 "If unavailable, DASH packaging will report an error and you can fall back to HLS.",
-        )
+        abr_format = fmt1.radio("Format", ["📡 HLS", "🎬 DASH", "🎁 Both"], horizontal=True, key="abr_format")
         abr_audio_kbps = fmt2.selectbox("Audio bitrate", [64, 96, 128, 160, 192], index=2, key="abr_audio_kbps")
-
         if abr_format in ("🎬 DASH", "🎁 Both") and not has_muxer("dash"):
-            st.warning("This ffmpeg build has no `dash` muxer — DASH packaging will fail. HLS will still work.")
-
-        st.markdown("<div class='section-title' style='margin-top:8px'>Per-title encoding</div>", unsafe_allow_html=True)
-
-        per_title = st.checkbox(
-            "🎯 Content-adaptive bitrates",
-            value=False,
-            help="Builds a per-rung bitrate ladder tailored to this specific title instead of a fixed ladder.",
-        )
-
+            st.warning("This ffmpeg build has no `dash` muxer.")
+        per_title = st.checkbox("🎯 Content-adaptive bitrates", value=False)
         ladder_preview = None
-
         if per_title and src_abr:
-            method = st.radio(
-                "Method",
-                ["⚡ Fast heuristic", "🎯 Measured (VMAF-targeted)"],
-                horizontal=True,
-                help=(
-                    "Fast heuristic: one signalstats motion/detail sample scales all rungs by the same "
-                    "factor — quick but approximate.\n\n"
-                    "Measured: probes each rung resolution with short real encodes and binary-searches "
-                    "the CRF that hits your target VMAF, then reads the actual resulting bitrate — the "
-                    "same rate-distortion-measurement idea behind Netflix per-title encoding and "
-                    "Visionular's Aurora CAE line. Slower (a few short encodes per rung) but reflects "
-                    "this title's real complexity per resolution, not a single global score."
-                ),
-            )
-
+            method = st.radio("Method", ["⚡ Fast heuristic", "🎯 Measured (VMAF-targeted)"], horizontal=True)
             if method == "⚡ Fast heuristic":
                 comp_key = f"complexity_{src_abr.name}_{src_abr.stat().st_mtime}"
-
                 if st.button("Analyze complexity", use_container_width=False):
                     sid_a = uuid.uuid4().hex
                     sm_a = media(src_abr)
-
                     with st.spinner("Sampling motion and spatial complexity…"):
                         score = analyze_complexity(src_abr, sm_a.get("duration", 0), sid_a)
-
                     st.session_state[comp_key] = score
-
                 score = st.session_state.get(comp_key)
-
                 if score is not None:
                     tier = "high motion" if score > 0.66 else ("moderate motion" if score > 0.33 else "low motion")
-
-                    st.markdown(
-                        f"<div class='info-strip'>Complexity score: {score:.2f} / 1.00 — {tier} content detected</div>",
-                        unsafe_allow_html=True,
-                    )
-
+                    st.markdown(f"<div class='info-strip'>Complexity score: {score:.2f} / 1.00 — {tier} content detected</div>", unsafe_allow_html=True)
                     ladder_preview = per_title_ladder(media(src_abr), score)
-
-                    st.dataframe(
-                        pd.DataFrame([
-                            {"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"]}
-                            for r in ladder_preview
-                        ]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
-                elif not has_filter("signalstats"):
-                    st.warning("This FFmpeg build does not include `signalstats`. Neutral 0.5 complexity ladder will be used.")
-
+                    st.dataframe(pd.DataFrame([{"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"]} for r in ladder_preview]), use_container_width=True, hide_index=True)
             else:
                 mv1, mv2 = st.columns(2)
-                target_vmaf = mv1.slider("Target VMAF", 80, 98, 93, help="Higher = larger files, more headroom for quality.")
+                target_vmaf = mv1.slider("Target VMAF", 80, 98, 93)
                 sample_sec = mv2.slider("Sample length per probe (s)", 4, 20, 8)
-
                 measured_key = f"measured_ladder_{src_abr.name}_{src_abr.stat().st_mtime}_{target_vmaf}_{sample_sec}"
-
                 if st.button("Run measured per-title analysis", use_container_width=False):
-                    with st.spinner("Probing each resolution rung with short real encodes — this takes a bit longer…"):
-                        st.session_state[measured_key] = per_title_ladder_measured(
-                            src_abr, media(src_abr), float(target_vmaf), float(sample_sec)
-                        )
-
+                    with st.status("Probing each resolution rung…", expanded=True) as status:
+                        st.write("Running short encodes per rung...")
+                        st.session_state[measured_key] = per_title_ladder_measured(src_abr, media(src_abr), float(target_vmaf), float(sample_sec))
+                        status.update(label="Analysis complete!", state="complete", expanded=False)
                 ladder_preview = st.session_state.get(measured_key)
-
                 if ladder_preview:
-                    st.dataframe(
-                        pd.DataFrame([
-                            {
-                                "Resolution": r["Resolution"],
-                                "Bitrate kbps": r["bitrate_kbps"],
-                                "CRF used": r.get("crf_used"),
-                                "Measured VMAF": round(r["measured_vmaf"], 1) if r.get("measured_vmaf") else "—",
-                            }
-                            for r in ladder_preview
-                        ]),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    if not has_filter("libvmaf"):
-                        st.caption("ℹ️ This FFmpeg build lacks libvmaf — probes used the SSIM-derived VMAF proxy instead of true VMAF.")
-
+                    st.dataframe(pd.DataFrame([{"Resolution": r["Resolution"], "Bitrate kbps": r["bitrate_kbps"], "CRF used": r.get("crf_used"), "Measured VMAF": round(r["measured_vmaf"], 1) if r.get("measured_vmaf") else "—"} for r in ladder_preview]), use_container_width=True, hide_index=True)
         if st.button("Generate ABR Package", type="primary"):
-            if not src_abr:
-                st.error("Upload or encode first.")
+            if not src_abr: st.error("Upload or encode first.")
             else:
                 sid = uuid.uuid4().hex
                 ladder = ladder_preview if (per_title and ladder_preview) else None
-                src_fps = media(src_abr).get("fps")  # feed real source fps into playlist/manifest
-
+                src_fps = media(src_abr).get("fps")
                 zp = OUT_DIR / f"abr_package_{int(time.time())}.zip"
                 any_success = False
                 all_errors: List[str] = []
-                zipped_files: List[str] = []   # CHANGED: track exactly what's in the zip, for display below
-
+                zipped_files: List[str] = []
                 with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
-
                     if abr_format in ("📡 HLS", "🎁 Both"):
-                        with st.spinner("Building HLS ladder…"):
-                            master, log, errors = make_hls(
-                                src_abr, sid, ladder=ladder,
-                                audio_bitrate=int(abr_audio_kbps),
-                                source_fps=src_fps,
-                                format="hls",
-                            )
-
-                        if errors:
-                            all_errors += [f"[HLS] {e}" for e in errors]
-                        if master.exists():
-                            for pf in master.parent.glob("*"):
-                                arcname = f"hls/{pf.name}"
-                                z.write(pf, arcname)
-                                zipped_files.append(arcname)
-                            any_success = True
-
+                        # [FIX-7] Use st.status for live feedback during HLS packaging
+                        with st.status("Building HLS ladder (this may take a few minutes)...", expanded=True) as status:
+                            st.write("Running FFmpeg HLS muxer...")
+                            master, log, errors = make_hls(src_abr, sid, ladder=ladder, audio_bitrate=int(abr_audio_kbps), source_fps=src_fps, format="hls")
+                            if errors: all_errors += [f"[HLS] {e}" for e in errors]
+                            if master.exists():
+                                for pf in master.parent.glob("*"):
+                                    arcname = f"hls/{pf.name}"
+                                    z.write(pf, arcname)
+                                    zipped_files.append(arcname)
+                                any_success = True
+                                status.update(label="HLS package complete!", state="complete")
                     if abr_format in ("🎬 DASH", "🎁 Both"):
-                        with st.spinner("Building DASH package…"):
-                            mpd, log2, errors2 = make_dash(
-                                src_abr, sid + "_dash", ladder=ladder,
-                                audio_bitrate=int(abr_audio_kbps),
-                                source_fps=src_fps,
-                            )
-
-                        if errors2:
-                            all_errors += [f"[DASH] {e}" for e in errors2]
-                        if mpd.exists():
-                            for pf in mpd.parent.glob("*"):
-                                arcname = f"dash/{pf.name}"
-                                z.write(pf, arcname)
-                                zipped_files.append(arcname)
-                            any_success = True
-
-                if all_errors:
-                    st.warning("Some packaging steps had issues:\n\n" + "\n".join(f"- {e}" for e in all_errors))
-
+                        # [FIX-7] Use st.status for live feedback during DASH packaging
+                        with st.status("Building DASH package (this may take a few minutes)...", expanded=True) as status:
+                            st.write("Running FFmpeg DASH muxer...")
+                            mpd, log2, errors2 = make_dash(src_abr, sid + "_dash", ladder=ladder, audio_bitrate=int(abr_audio_kbps), source_fps=src_fps)
+                            if errors2: all_errors += [f"[DASH] {e}" for e in errors2]
+                            if mpd.exists():
+                                for pf in mpd.parent.glob("*"):
+                                    arcname = f"dash/{pf.name}"
+                                    z.write(pf, arcname)
+                                    zipped_files.append(arcname)
+                                any_success = True
+                                status.update(label="DASH package complete!", state="complete")
+                if all_errors: st.warning("Some packaging steps had issues:\n\n" + "\n".join(f"- {e}" for e in all_errors))
                 if any_success:
-                    st.success(
-                        "ABR package ready"
-                        + (" with per-title bitrates." if ladder else ".")
-                    )
-
-                    # CHANGED (V4.2): preview both manifests inline (previously only HLS
-                    # got a st.code() preview) and list every file the zip contains, so
-                    # it's obvious where the HLS and DASH output actually live before
-                    # you download or unzip anything.
+                    st.success("ABR package ready" + (" with per-title bitrates." if ladder else "."))
                     if abr_format in ("📡 HLS", "🎁 Both") and master.exists():
-                        with st.expander("📡 HLS — master.m3u8", expanded=True):
-                            st.code(master.read_text(), language="text")
-                            st.caption(f"Segments alongside it in the zip under `hls/` ({len([f for f in zipped_files if f.startswith('hls/')])} files).")
-
+                        with st.expander("📡 HLS — master.m3u8", expanded=True): st.code(master.read_text(), language="text")
                     if abr_format in ("🎬 DASH", "🎁 Both") and mpd.exists():
-                        with st.expander("🎬 DASH — manifest.mpd", expanded=True):
-                            st.code(mpd.read_text(), language="xml")
-                            st.caption(f"Init/media segments alongside it in the zip under `dash/` ({len([f for f in zipped_files if f.startswith('dash/')])} files).")
-
-                    with st.expander("📁 Full zip contents"):
-                        st.code("\n".join(sorted(zipped_files)), language="text")
-
-                    st.download_button(
-                        "⬇ Download ABR Package",
-                        zp.read_bytes(),
-                        zp.name,
-                        "application/zip",
-                    )
-
-                    st.caption(
-                        "To test playback locally: `ffplay hls/master.m3u8` or `ffplay dash/manifest.mpd`, "
-                        "or drop the unzipped folder into a local server and open it with hls.js / dash.js / "
-                        "a player like VLC or Shaka Player."
-                    )
-                else:
-                    st.error("No packaging output was produced — see errors above.")
-
+                        with st.expander("🎬 DASH — manifest.mpd", expanded=True): st.code(mpd.read_text(), language="xml")
+                    with st.expander("📁 Full zip contents"): st.code("\n".join(sorted(zipped_files)), language="text")
+                    st.download_button("⬇ Download ABR Package", zp.read_bytes(), zp.name, "application/zip")
+                else: st.error("No packaging output was produced.")
 
 # ============================================================
 # QC tab (V4.2)
 # ============================================================
-
 with tab_qc:
     st.markdown("<div class='section-title'>File-Based QC</div>", unsafe_allow_html=True)
-    st.caption(
-        "Container integrity, video/audio spec compliance, black/freeze frame detection, silence/clipping/"
-        "phase, and EBU R128 / ATSC A/85 loudness. Macroblocking and banding are surfaced as unverified "
-        "proxies (no reliable open-source detector exists) rather than hard-gated — see each check's detail."
-    )
-
     qc_src: Optional[Path] = None
-
     with st.container(border=True):
-        qsrc_choice = st.radio(
-            "Source",
-            ["Use current source", "Use latest output", "Upload new"],
-            horizontal=True,
-            key="qc_src_choice",
-        )
-
-        if qsrc_choice == "Use current source" and st.session_state.src:
-            qc_src = Path(st.session_state.src)
-        elif qsrc_choice == "Use latest output" and st.session_state.out:
-            qc_src = Path(st.session_state.out)
+        qsrc_choice = st.radio("Source", ["Use current source", "Use latest output", "Upload new"], horizontal=True, key="qc_src_choice")
+        if qsrc_choice == "Use current source" and st.session_state.src: qc_src = Path(st.session_state.src)
+        elif qsrc_choice == "Use latest output" and st.session_state.out: qc_src = Path(st.session_state.out)
         elif qsrc_choice == "Upload new":
-            qu = st.file_uploader(
-                "Upload file for QC",
-                type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"],
-                key="qc_upload",
-            )
-            if qu:
-                qc_src = save_upload(qu, IN_DIR)
-
-        if qc_src and qc_src.exists():
-            st.caption(f"Target file: {qc_src.name}")
-        elif qsrc_choice != "Upload new":
-            st.info("No file available for that choice yet — upload or encode something first.")
-
+            qu = st.file_uploader("Upload file for QC", type=["mp4", "mov", "mkv", "webm", "avi", "m4v", "ts"], key="qc_upload")
+            if qu: qc_src = save_upload(qu, IN_DIR)
+        if qc_src and qc_src.exists(): st.caption(f"Target file: {qc_src.name}")
+        elif qsrc_choice != "Upload new": st.info("No file available for that choice yet.")
         qc1, qc2 = st.columns(2)
         qc_spec_name = qc1.selectbox("Delivery spec", list(QC_SPECS.keys()), index=0, key="qc_spec")
         qc_scan_depth = qc2.selectbox("Scan depth", ["Quick (first 60s)", "Full file"], index=0, key="qc_scan_depth")
         qc_sample_seconds = None if qc_scan_depth == "Full file" else 60.0
-
         if st.button("🔎 Run QC", type="primary", use_container_width=True):
-            if not qc_src or not qc_src.exists():
-                st.error("Select or upload a file first.")
+            if not qc_src or not qc_src.exists(): st.error("Select or upload a file first.")
             else:
                 sid = uuid.uuid4().hex
                 qm = media(qc_src)
-
-                with st.spinner("Running container / video / audio QC probes…"):
+                # [FIX-7] Use st.status for live feedback during QC
+                with st.status("Running container / video / audio QC probes…", expanded=True) as status:
+                    st.write("Analyzing file...")
                     report = run_qc(qc_src, qm, qc_spec_name, sid, run_filters=True, sample_seconds=qc_sample_seconds)
-
+                    status.update(label="QC complete!", state="complete", expanded=False)
                 st.session_state["qc_last_report"] = report
                 st.session_state["qc_last_file"] = qc_src.name
-
     report = st.session_state.get("qc_last_report")
-
     if report:
-        st.markdown(
-            f"<div class='section-title'>Result — {st.session_state.get('qc_last_file', '')}</div>",
-            unsafe_allow_html=True,
-        )
-
+        st.markdown(f"<div class='section-title'>Result — {st.session_state.get('qc_last_file', '')}</div>", unsafe_allow_html=True)
         verdict = report["verdict"]
-
-        if verdict == "FAIL":
-            st.error(f"❌ FAIL — {report['n_fail']} failing check(s), {report['n_warn']} warning(s), {report['n_pass']} passed.")
-        elif verdict == "WARNING":
-            st.warning(f"⚠️ WARNING — {report['n_warn']} warning(s), {report['n_pass']} passed. No hard failures.")
-        else:
-            st.success(f"✅ PASS — all {report['n_pass']} checks passed.")
-
+        if verdict == "FAIL": st.error(f"❌ FAIL — {report['n_fail']} failing check(s).")
+        elif verdict == "WARNING": st.warning(f"⚠️ WARNING — {report['n_warn']} warning(s).")
+        else: st.success(f"✅ PASS — all {report['n_pass']} checks passed.")
         icon_map = {"pass": "✅", "warn": "⚠️", "fail": "❌"}
         qc_df = pd.DataFrame(report["checks"])
         qc_df["Status"] = qc_df["status"].map(icon_map)
-
-        st.dataframe(
-            qc_df[["category", "check", "Status", "detail"]].rename(
-                columns={"category": "Category", "check": "Check", "detail": "Detail"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        st.download_button(
-            "⬇ Download QC report (JSON)",
-            json.dumps(report, indent=2).encode(),
-            f"qc_report_{clean(st.session_state.get('qc_last_file', 'file'))}.json",
-            "application/json",
-        )
-
+        st.dataframe(qc_df[["category", "check", "Status", "detail"]].rename(columns={"category": "Category", "check": "Check", "detail": "Detail"}), use_container_width=True, hide_index=True)
+        st.download_button("⬇ Download QC report (JSON)", json.dumps(report, indent=2).encode(), f"qc_report_{clean(st.session_state.get('qc_last_file', 'file'))}.json", "application/json")
 
 # ============================================================
 # Logs tab
 # ============================================================
-
 with tab_logs:
     st.markdown("<div class='section-title'>Session Logs</div>", unsafe_allow_html=True)
-
     csv_p = LOG_DIR / "sessions.csv"
-
     with st.container(border=True):
         if csv_p.exists():
             df = pd.read_csv(csv_p)
             st.dataframe(df.tail(200), use_container_width=True)
-
-            st.download_button(
-                "⬇ Download sessions CSV",
-                csv_p.read_bytes(),
-                "sessions.csv",
-                "text/csv",
-            )
-        else:
-            st.info("No sessions yet.")
-
+            st.download_button("⬇ Download sessions CSV", csv_p.read_bytes(), "sessions.csv", "text/csv")
+        else: st.info("No sessions yet.")
         logs = sorted(LOG_DIR.glob("*.log"), key=lambda x: x.stat().st_mtime, reverse=True)
-
         if logs:
             sel = st.selectbox("Log file", logs, format_func=lambda x: x.name)
             st.text_area("Preview", sel.read_text(errors="ignore")[-10000:], height=320)
-
-            st.download_button(
-                "⬇ Download selected log",
-                sel.read_bytes(),
-                sel.name,
-                "text/plain",
-            )
-
+            st.download_button("⬇ Download selected log", sel.read_bytes(), sel.name, "text/plain")
     with st.container(border=True):
         with st.expander("🔧 Diagnostics"):
             st.write("FFmpeg:", "✅ Ready" if info["ffmpeg"] else "❌ Missing")
             st.caption(info.get("version", ""))
-
             st.write("FFprobe:", "✅ Ready" if info["ffprobe"] else "❌ Missing")
-
-            st.write(
-                f"x264 {'✅' if has_encoder('libx264') else '⚠️'} · "
-                f"x265 {'✅' if has_encoder('libx265') else '⚠️'} · "
-                f"SVT-AV1 {'✅' if has_encoder('libsvtav1') else '⚠️'} · "
-                f"AOM-AV1 {'✅' if has_encoder('libaom-av1') else '⚠️'} · "
-                f"libvmaf {'✅' if has_filter('libvmaf') else '⚠️'} · "
-                f"signalstats {'✅' if has_filter('signalstats') else '⚠️'} · "
-                f"nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · "
-                f"deband {'✅' if has_filter('deband') else '⚠️'} · "
-                f"ebur128 {'✅' if has_filter('ebur128') else '⚠️'} · "
-                f"dash muxer {'✅' if has_muxer('dash') else '⚠️'}"
-            )
-
+            st.write(f"x264 {'✅' if has_encoder('libx264') else '⚠️'} · x265 {'✅' if has_encoder('libx265') else '⚠️'} · SVT-AV1 {'✅' if has_encoder('libsvtav1') else '⚠️'} · AOM-AV1 {'✅' if has_encoder('libaom-av1') else '⚠️'} · libvmaf {'✅' if has_filter('libvmaf') else '⚠️'} · signalstats {'✅' if has_filter('signalstats') else '⚠️'} · nlmeans {'✅' if has_filter('nlmeans') else '⚠️'} · deband {'✅' if has_filter('deband') else '⚠️'} · ebur128 {'✅' if has_filter('ebur128') else '⚠️'} · dash muxer {'✅' if has_muxer('dash') else '⚠️'}")
             st.info("For Streamlit Cloud, add a repo-root file named `packages.txt` containing exactly: `ffmpeg`.")
-
-            st.code(
-                "Recommended requirements.txt:\n"
-                "streamlit>=1.36\n"
-                "pandas>=2.0\n"
-                "numpy>=1.26\n"
-                "streamlit-webrtc>=0.47\n"
-                "av>=12.0\n",
-                language="text",
-            )
+            st.code("Recommended requirements.txt:\nstreamlit>=1.36\npandas>=2.0\nnumpy>=1.26\nstreamlit-webrtc>=0.47\nav>=12.0\n", language="text")
