@@ -1086,11 +1086,18 @@ def _run_encode_pass(
     label: str = "Encoding",
     timeout: int = 3600,
 ) -> Tuple[int, List[str]]:
+    # [PERF-1] The log file is now opened ONCE for the whole encode pass
+    # instead of once per stderr line. FFmpeg emits many progress lines per
+    # second; the previous implementation did an open+write+close (with its
+    # OS-level flush) on EVERY line, adding real wall-clock overhead to
+    # every encode/probe/sweep step and competing with FFmpeg for disk I/O.
+    # The in-memory tail buffer is also now bounded (~300 lines) instead of
+    # growing without limit for the whole encode, since only the last ~120
+    # lines are ever surfaced to the user on failure.
     lines: List[str] = []
+    max_buffered_lines = 300
     lo, hi = phase
     log.parent.mkdir(parents=True, exist_ok=True)
-    with log.open("a", encoding="utf-8") as f:
-        f.write("\n\n$ " + " ".join(map(str, cmd)) + "\n")
     try:
         proc = subprocess.Popen(
             cmd,
@@ -1106,31 +1113,31 @@ def _run_encode_pass(
     last = lo
     start_t = time.time()
     assert proc.stderr is not None
-    try:
-        for line in proc.stderr:
-            lines.append(line.rstrip())
-            with log.open("a", encoding="utf-8") as f:
-                f.write(line)
-            m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
-            if m and cb and duration > 0:
-                sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                pct = lo + (hi - lo) * min(max(sec / duration, 0.0), 1.0)
-                pct = max(pct, last)
-                last = pct
-                try:
-                    cb(pct, f"{label}… {pct * 100:.0f}%")
-                except Exception:
-                    pass
-            if time.time() - start_t > timeout:
-                proc.kill()
-                with log.open("a", encoding="utf-8") as f:
-                    f.write(f"\n[timeout after {timeout}s] killed\n")
-                return -9, lines
-    except Exception as e:
-        with log.open("a", encoding="utf-8") as f:
-            f.write(f"\n[stream read error] {e}\n")
-    rc = proc.wait()
     with log.open("a", encoding="utf-8") as f:
+        f.write("\n\n$ " + " ".join(map(str, cmd)) + "\n")
+        try:
+            for line in proc.stderr:
+                f.write(line)
+                lines.append(line.rstrip())
+                if len(lines) > max_buffered_lines:
+                    lines.pop(0)
+                m = re.search(r"time=(\d+):(\d+):(\d+(?:\.\d+)?)", line)
+                if m and cb and duration > 0:
+                    sec = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                    pct = lo + (hi - lo) * min(max(sec / duration, 0.0), 1.0)
+                    pct = max(pct, last)
+                    last = pct
+                    try:
+                        cb(pct, f"{label}… {pct * 100:.0f}%")
+                    except Exception:
+                        pass
+                if time.time() - start_t > timeout:
+                    proc.kill()
+                    f.write(f"\n[timeout after {timeout}s] killed\n")
+                    return -9, lines
+        except Exception as e:
+            f.write(f"\n[stream read error] {e}\n")
+        rc = proc.wait()
         f.write(f"\n[exit] {rc}\n")
     return rc, lines
 
@@ -1390,30 +1397,27 @@ def quality_metrics(
     else:
         eff_limit = None
     limit = ["-t", str(eff_limit)] if eff_limit else []
-    graph = (
-        f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[refp][refs];"
-        f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[distp][dists];"
-        f"[refp][distp]psnr;"
-        f"[refs][dists]ssim"
-    )
-    out = run_ffmpeg(
-        [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
-        + limit
-        + ["-lavfi", graph, "-an", "-f", "null", "-"],
-        log, 600,
-    )
-    m = re.search(r"average:([0-9.]+|inf)", out)
-    if m:
-        res["PSNR"] = 100.0 if m.group(1) == "inf" else float(m.group(1))
-    m = re.search(r"All:([0-9.]+)", out)
-    if m:
-        res["SSIM"] = float(m.group(1))
+
+    # [PERF-2] Collapsed to a SINGLE ffmpeg decode pass in the common case
+    # (libvmaf available). Previously this ran up to three full decode
+    # passes: one lavfi `psnr;ssim` pass, one separate `libvmaf` pass, and
+    # (if temporal_pooling requested) a THIRD pass just to re-pool VMAF with
+    # a different pooling method. libvmaf can compute PSNR and SSIM itself
+    # as additional "features" of the same run, and we ask it to pool with
+    # harmonic_mean directly instead of doing another whole decode — so we
+    # now request everything in one pass and only fall back to the lighter
+    # lavfi psnr/ssim pass if libvmaf is unavailable or its build doesn't
+    # expose those features. This especially speeds up
+    # find_crf_for_target_vmaf() / per_title_ladder_measured(), which call
+    # this function repeatedly inside a binary search.
     if has_filter("libvmaf"):
         js = LOG_DIR / f"{sid}_vmaf.json"
+        pool_opt = ":pool=harmonic_mean" if temporal_pooling else ""
         graph_v = (
             f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[ref];"
             f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[dist];"
-            f"[dist][ref]libvmaf=log_fmt=json:log_path={js}"
+            f"[dist][ref]libvmaf=log_fmt=json:log_path={js}:"
+            f"feature=name=psnr|name=float_ssim{pool_opt}"
         )
         run_ffmpeg(
             [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
@@ -1423,34 +1427,57 @@ def quality_metrics(
         )
         try:
             data = json.loads(js.read_text())
+            pooled = data.get("pooled_metrics", {})
             # [FIX-3] Safe fallback chain for VMAF JSON parsing (prevents TypeError on newer libvmaf)
-            vmaf_data = data.get("pooled_metrics", {}).get("vmaf", {})
+            vmaf_data = pooled.get("vmaf", {})
             vmaf_score = vmaf_data.get("mean") or vmaf_data.get("harmonic_mean") or vmaf_data.get("average")
             if vmaf_score is not None:
                 res["VMAF"] = float(vmaf_score)
+            if temporal_pooling:
+                harmonic_score = vmaf_data.get("harmonic_mean") or vmaf_data.get("mean")
+                if harmonic_score is not None:
+                    res["VMAF_harmonic"] = float(harmonic_score)
+            # PSNR/SSIM come back as libvmaf "features" in the same JSON —
+            # try the common Y-plane key with a generic fallback.
+            psnr_data = pooled.get("psnr_y") or pooled.get("psnr")
+            if psnr_data:
+                psnr_val = psnr_data.get("mean") or psnr_data.get("harmonic_mean")
+                if psnr_val is not None:
+                    res["PSNR"] = float(psnr_val)
+            ssim_data = pooled.get("float_ssim") or pooled.get("ssim")
+            if ssim_data:
+                ssim_val = ssim_data.get("mean") or ssim_data.get("harmonic_mean")
+                if ssim_val is not None:
+                    res["SSIM"] = float(ssim_val)
         except Exception:
             pass
-        if temporal_pooling:
-            js_h = LOG_DIR / f"{sid}_vmaf_harmonic.json"
-            graph_vh = (
-                f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[ref];"
-                f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p[dist];"
-                f"[dist][ref]libvmaf=log_fmt=json:log_path={js_h}:pool=harmonic_mean"
-            )
-            run_ffmpeg(
-                [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
-                + limit
-                + ["-lavfi", graph_vh, "-an", "-f", "null", "-"],
-                log, 900,
-            )
-            try:
-                data_h = json.loads(js_h.read_text())
-                res["VMAF_harmonic"] = float(
-                    data_h.get("pooled_metrics", {}).get("vmaf", {}).get("mean")
-                )
-            except Exception:
-                pass
-    elif res.get("SSIM"):
+
+    # Fallback: libvmaf unavailable, or ran but its build didn't expose
+    # psnr/float_ssim as features — do the lightweight lavfi psnr/ssim pass
+    # instead of leaving those fields missing.
+    if "PSNR" not in res or "SSIM" not in res:
+        graph = (
+            f"[0:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[refp][refs];"
+            f"[1:v]setpts=PTS-STARTPTS,scale={w}:{h}:flags=bicubic,format=yuv420p,split=2[distp][dists];"
+            f"[refp][distp]psnr;"
+            f"[refs][dists]ssim"
+        )
+        out = run_ffmpeg(
+            [info["ffmpeg"], "-hide_banner", "-nostats", "-i", str(ref), "-i", str(dist)]
+            + limit
+            + ["-lavfi", graph, "-an", "-f", "null", "-"],
+            log, 600,
+        )
+        if "PSNR" not in res:
+            m = re.search(r"average:([0-9.]+|inf)", out)
+            if m:
+                res["PSNR"] = 100.0 if m.group(1) == "inf" else float(m.group(1))
+        if "SSIM" not in res:
+            m = re.search(r"All:([0-9.]+)", out)
+            if m:
+                res["SSIM"] = float(m.group(1))
+
+    if "VMAF" not in res and res.get("SSIM"):
         ssim = res["SSIM"]
         dm = media(dist)
         bpp = 0.0
